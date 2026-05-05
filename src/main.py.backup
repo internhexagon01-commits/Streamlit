@@ -1,0 +1,1697 @@
+"""
+main.py — Corrective RAG agent for NovAtel documentation Q&A + uploaded log Q&A.
+
+Fixes applied vs previous version:
+  1. _build_event_index ITDETECTSTATUS block — rewrote to use corrected
+     decode_itdetectstatus() return structure (entries list, not jammer_status etc.)
+  2. _build_event_index tracking — removed tracking_lt4_sats (belongs to AUX4,
+     not RXSTATUS); replaced with tracking_degraded / tracking_critical from AUX4.
+  3. Event index keys — removed dead itdetect_jamming / itdetect_spoofing keys;
+     unified under itdetect_interference.
+  4. analyze_events docstring + event keys — aligned tracking_degraded /
+     tracking_critical with event index keys.
+  5. query_log freq search — fixed to search MHz (not Hz) to match ITDETECTSTATUS
+     fields_raw which stores center_freq_mhz as a float in MHz.
+  6. _AGENT_SYSTEM_PROMPT — updated event type list to remove stale keys.
+  7. _current_session — replaced module-level mutable dict with contextvars.ContextVar
+     for async-safe per-request session isolation.
+  8. _normalize_freq_search — removed (dead code, never called).
+  9. decode_rxstatus — spoofing=bit9, jamming=bit15 (corrected from bit26/bit28).
+ 10. decode_itdetectstatus — full rewrite to match actual log format (num_entries +
+     repeated 9-field blocks; STATISTICALANALYSIS params are reserved).
+ 11. _merge_jamming_events — new helper that merges RXSTATUS + ITDETECTSTATUS events
+     sharing the same (week, seconds) timestamp into a single entry, so same-second
+     events are never double-counted.
+ 12. analyze_events jamming/spoofing — now returns merged event list with sources[],
+     rxstatus_bits[], itdetect_entries[] per entry instead of two separate lists.
+ 13. query_log limit=None — None means return ALL matching records (no truncation).
+     A warning field is added only when the caller explicitly passes a limit and
+     results are truncated. Agents should omit limit for min/max/aggregate queries.
+ 14. query_log field_stats — server-side min/max computed over ALL matching records
+     before any capping. Each numeric field position gets {min, max, min_record,
+     max_record} so the agent never needs to scan records[] for aggregate answers.
+     This is immune to _cap_tool_response trimming because scalars are never trimmed.
+ 15. _cap_tool_response — now sets truncated=True and adds a warning when it trims
+     the records[] list, so the agent always knows when it has a partial record set.
+"""
+
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
+from langgraph.errors import GraphRecursionError
+from bedrock_agentcore import BedrockAgentCoreApp
+from bedrock_agentcore.memory.client import MemoryClient
+from src.model.load import load_model
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain.tools import tool
+from langgraph.prebuilt import create_react_agent
+import boto3
+import base64
+import os
+import time
+import json
+import io
+import re
+import tempfile
+import datetime
+import contextvars
+import pandas as pd
+from collections import Counter
+from botocore.config import Config as BotocoreConfig
+from urllib.parse import urlparse
+
+
+# ── GPS time constants ────────────────────────────────────────────────
+# GPS epoch: Jan 6 1980 00:00:00 UTC
+_GPS_EPOCH = datetime.datetime(1980, 1, 6, tzinfo=datetime.timezone.utc)
+# Current GPS-UTC leap seconds (2017 value = 18)
+_LEAP_SECONDS = 18
+
+
+def gps_to_utc(week: int, seconds: float) -> datetime.datetime:
+    """Convert GPS week + seconds-of-week to UTC datetime."""
+    gps_seconds = week * 604800 + seconds
+    utc_dt = _GPS_EPOCH + datetime.timedelta(seconds=gps_seconds - _LEAP_SECONDS)
+    return utc_dt
+
+
+def gps_to_utc_str(week: int, seconds: float) -> str:
+    """Return ISO-8601 UTC string for a GPS week/seconds pair."""
+    if week <= 0:
+        return ""
+    return gps_to_utc(week, seconds).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+# ── Config ────────────────────────────────────────────────────────────
+import streamlit as st
+
+# Try to load from Streamlit secrets first (for Streamlit Cloud), then fall back to environment variables
+def get_config(key: str, default: str = "") -> str:
+    """Get configuration from Streamlit secrets or environment variables."""
+    try:
+        # Try Streamlit secrets first (for Streamlit Cloud deployment)
+        return st.secrets.get(key, os.getenv(key, default))
+    except (FileNotFoundError, KeyError):
+        # Fall back to environment variables (for local development)
+        return os.getenv(key, default)
+
+REGION          = "us-east-1"
+MEMORY_ID       = get_config("MEMORY_ID", "")
+S3_BUCKET       = get_config("S3_BUCKET", "")
+KB_ID           = get_config("KB_ID", "FH00WKSBPL")
+GUARDRAIL_ID    = get_config("GUARDRAIL_ID", "")
+GUARDRAIL_VER   = get_config("GUARDRAIL_VERSION", "1")
+ACTOR_ID        = "default-user"
+CHUNK_SIZE      = 1000
+SIZE_THRESHOLD  = 5 * 1024 * 1024
+MAX_RESULTS     = int(get_config("MAX_RESULTS", "10"))
+EXPANSION_PAGES = int(get_config("EXPANSION_PAGES", "2"))
+
+_LLM_COLS = {"element_id", "element_type", "content_markdown", "page_number"}
+
+app = BedrockAgentCoreApp()
+
+
+# ── Lazy singletons ───────────────────────────────────────────────────
+_llm = _memory_client = _s3_client = _kb_client = _bedrock_runtime = None
+_BOTO_CONFIG = BotocoreConfig(read_timeout=300)
+
+
+def get_llm():
+    global _llm
+    if _llm is None:
+        _llm = load_model()
+    return _llm
+
+
+def get_memory_client():
+    global _memory_client
+    if _memory_client is None:
+        _memory_client = MemoryClient(region_name=REGION)
+    return _memory_client
+
+
+def get_s3_client():
+    global _s3_client
+    if _s3_client is None:
+        # Try to get credentials from Streamlit secrets first
+        try:
+            import streamlit as st
+            if "AWS_ACCESS_KEY_ID" in st.secrets:
+                _s3_client = boto3.client(
+                    "s3",
+                    region_name="ap-south-1",
+                    aws_access_key_id=st.secrets["AWS_ACCESS_KEY_ID"],
+                    aws_secret_access_key=st.secrets["AWS_SECRET_ACCESS_KEY"],
+                    config=_BOTO_CONFIG
+                )
+            else:
+                # Fall back to default credentials (environment variables, IAM role, etc.)
+                _s3_client = boto3.client("s3", region_name="ap-south-1", config=_BOTO_CONFIG)
+        except (FileNotFoundError, KeyError, ImportError):
+            # Fall back to default credentials
+            _s3_client = boto3.client("s3", region_name="ap-south-1", config=_BOTO_CONFIG)
+    return _s3_client
+
+
+def get_kb_client():
+    global _kb_client
+    if _kb_client is None:
+        try:
+            import streamlit as st
+            if "AWS_ACCESS_KEY_ID" in st.secrets:
+                _kb_client = boto3.client(
+                    "bedrock-agent-runtime",
+                    region_name="us-west-2",
+                    aws_access_key_id=st.secrets["AWS_ACCESS_KEY_ID"],
+                    aws_secret_access_key=st.secrets["AWS_SECRET_ACCESS_KEY"],
+                    config=_BOTO_CONFIG
+                )
+            else:
+                _kb_client = boto3.client("bedrock-agent-runtime", region_name="us-west-2", config=_BOTO_CONFIG)
+        except (FileNotFoundError, KeyError, ImportError):
+            _kb_client = boto3.client("bedrock-agent-runtime", region_name="us-west-2", config=_BOTO_CONFIG)
+    return _kb_client
+
+
+def get_bedrock_runtime():
+    global _bedrock_runtime
+    if _bedrock_runtime is None:
+        try:
+            import streamlit as st
+            if "AWS_ACCESS_KEY_ID" in st.secrets:
+                _bedrock_runtime = boto3.client(
+                    "bedrock-runtime",
+                    region_name="us-west-2",
+                    aws_access_key_id=st.secrets["AWS_ACCESS_KEY_ID"],
+                    aws_secret_access_key=st.secrets["AWS_SECRET_ACCESS_KEY"],
+                    config=_BOTO_CONFIG
+                )
+            else:
+                _bedrock_runtime = boto3.client("bedrock-runtime", region_name="us-west-2", config=_BOTO_CONFIG)
+        except (FileNotFoundError, KeyError, ImportError):
+            _bedrock_runtime = boto3.client("bedrock-runtime", region_name="us-west-2", config=_BOTO_CONFIG)
+    return _bedrock_runtime
+
+
+# ── Guardrail ─────────────────────────────────────────────────────────
+def apply_guardrail(text: str, source: str = "INPUT") -> str:
+    if not GUARDRAIL_ID:
+        return text
+    try:
+        resp = get_bedrock_runtime().apply_guardrail(
+            guardrailIdentifier=GUARDRAIL_ID,
+            guardrailVersion=GUARDRAIL_VER,
+            source=source,
+            content=[{"text": {"text": text}}],
+        )
+        if resp["action"] == "GUARDRAIL_INTERVENED":
+            blocked = resp.get("outputs", [{}])[0].get("text", "Content blocked by guardrail.")
+            raise ValueError(blocked)
+    except ValueError:
+        raise
+    except Exception as e:
+        print(f"[GUARDRAIL] failed: {e}")
+    return text
+
+
+# ── KB helpers ────────────────────────────────────────────────────────
+_tool_call_log: list[dict] = []
+_csv_cache: dict[str, pd.DataFrame] = {}
+
+
+def _download_and_parse_key(bucket: str, key: str) -> pd.DataFrame:
+    with tempfile.NamedTemporaryFile(mode="w+b", delete=False) as tmp:
+        get_s3_client().download_fileobj(bucket, key, tmp)
+        tmp.flush()
+        tmp_path = tmp.name
+    try:
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        try:
+            data = json.loads(raw)
+            rows = [e["contentMetadata"] for e in data.get("fileContents", []) if "contentMetadata" in e]
+            df = pd.DataFrame(rows)
+            print(f"[CSV] Parsed {len(df)} rows from JSON: s3://{bucket}/{key}")
+        except (json.JSONDecodeError, KeyError):
+            df = pd.read_csv(io.StringIO(raw))
+            print(f"[CSV] Parsed {len(df)} rows from CSV: s3://{bucket}/{key}")
+    finally:
+        os.unlink(tmp_path)
+    return df
+
+
+def _download_and_parse(source_uri: str) -> pd.DataFrame:
+    if source_uri in _csv_cache:
+        return _csv_cache[source_uri]
+    parsed = urlparse(source_uri)
+    if parsed.scheme != "s3":
+        raise ValueError(f"Invalid S3 URI: {source_uri}")
+    bucket = parsed.netloc
+    key    = parsed.path.lstrip("/")
+    df = _download_and_parse_key(bucket, key)
+    if "element_id" not in df.columns and not key.startswith("Output/"):
+        df = _download_and_parse_key(bucket, f"Output/{key}")
+    if "page_number" in df.columns:
+        df["page_number"] = pd.to_numeric(df["page_number"], errors="coerce").fillna(0).astype(int)
+    _csv_cache[source_uri] = df
+    return df
+
+
+def _resolve_data_uri(source_uri: str) -> str:
+    if not source_uri.lower().endswith(".pdf"):
+        return source_uri
+    for entry in reversed(_tool_call_log):
+        if entry.get("tool") != "kb_retriever":
+            continue
+        for el in entry["result"].get("elements", []):
+            if el.get("source_uri") == source_uri and el.get("csv_source_uri"):
+                return el["csv_source_uri"]
+    raise ValueError(f"Cannot resolve data URI from PDF path: {source_uri}")
+
+
+# ── NovAtel ASCII log parser + in-memory store ────────────────────────
+# Store keyed by session_id so each upload is isolated per browser session.
+_log_store: dict[str, dict] = {}
+
+# NovAtel ASCII header:
+#   #LOGNAME,PORT,SEQ,IDLE%,TIME_STATUS,WEEK,SECONDS,RX_STATUS,RSVD,SW_VER;FIELDS*CRC
+_ASCII_FULL_RE = re.compile(
+    r"^#(?P<log_name>[A-Z0-9_]+),"
+    r"(?P<header>[^;]*);"
+    r"(?P<fields>.*?)"
+    r"(?:\*[0-9a-fA-F]{1,8})?\s*$"
+)
+
+
+def _parse_line(line: str) -> dict | None:
+    m = _ASCII_FULL_RE.match(line.strip())
+    if not m:
+        return None
+    g = m.groupdict()
+    h = [p.strip() for p in g["header"].split(",")]
+
+    def _get(i, d=""):
+        return h[i] if i < len(h) else d
+
+    def _tryf(v, d=0.0):
+        try:
+            return float(v)
+        except Exception:
+            return d
+
+    def _tryi(v, d=0):
+        try:
+            return int(v)
+        except Exception:
+            return d
+
+    # Normalize BESTPOSA → BESTPOS so queries match both
+    log_name   = g["log_name"]
+    normalized = log_name[:-1] if (log_name.endswith("A") and len(log_name) > 4) else log_name
+
+    week    = _tryi(_get(4))
+    seconds = _tryf(_get(5))
+
+    return {
+        "log_name":     normalized,
+        "log_name_raw": log_name,
+        "port":         _get(0),
+        "seq":          _tryi(_get(1)),
+        "idle_pct":     _tryf(_get(2)),
+        "time_status":  _get(3),
+        "week":         week,
+        "seconds":      seconds,
+        "utc_time":     gps_to_utc_str(week, seconds),
+        "rx_status":    _get(6),
+        "fields_raw":   g["fields"],
+    }
+
+
+def parse_novatel_ascii(text: str) -> pd.DataFrame:
+    records = []
+    skipped = 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        rec = _parse_line(line)
+        if rec:
+            records.append(rec)
+        else:
+            skipped += 1
+    print(f"[PARSE] matched={len(records)} skipped={skipped}")
+    return pd.DataFrame(records) if records else pd.DataFrame()
+
+
+# ── RXSTATUS bit decoder ──────────────────────────────────────────────
+_RXSTATUS_BITS = {
+    0:  "Error flag",
+    1:  "Temperature status warning",
+    2:  "Voltage supply status warning",
+    3:  "Primary antenna not powered",
+    4:  "LNA failure",
+    5:  "Primary antenna open circuit",
+    6:  "Primary antenna short circuit",
+    7:  "CPU overload",
+    8:  "COM port transmit buffer overrun",
+    9:  "Spoofing detected",
+    # 10: Reserved
+    11: "Link overrun",
+    12: "Input overrun",
+    13: "Aux transmit overrun",
+    14: "Antenna gain out of range",
+    15: "Jammer detected",
+    16: "INS reset",
+    17: "IMU communication failure",
+    18: "GPS almanac / UTC invalid",
+    19: "Position solution invalid",
+    20: "Position fixed",
+    21: "Clock steering disabled",
+    22: "Clock model invalid",
+    23: "External oscillator locked",
+    24: "Software resource warning",
+    25: "Version bit 0",
+    26: "Version bit 1",
+    27: "HDR tracking mode",
+    28: "Digital filtering enabled",
+    29: "Auxiliary 3 status event",
+    30: "Auxiliary 2 status event",
+    31: "Auxiliary 1 status event",
+}
+
+
+def decode_rxstatus(hex_str: str) -> dict:
+    """
+    Decode an RXSTATUS hex word (e.g. '0x00000020' or '00000020').
+
+    Returns a dict with:
+        raw_hex          : str
+        set_bits         : list of {bit, name} for every set bit
+        error_flag       : bool  (bit 0)
+        spoofing_detected: bool  (bit 9)
+        jamming_detected : bool  (bit 15)
+        antenna_open     : bool  (bit 5)
+        antenna_shorted  : bool  (bit 6)
+        position_invalid : bool  (bit 19)
+    """
+    try:
+        val = int(hex_str.strip(), 16)
+    except (ValueError, AttributeError):
+        return {"raw_hex": hex_str, "set_bits": [], "decode_error": True}
+
+    set_bits = []
+    for bit, name in _RXSTATUS_BITS.items():
+        if val & (1 << bit):
+            set_bits.append({"bit": bit, "name": name})
+
+    return {
+        "raw_hex":            hex_str.strip(),
+        "set_bits":           set_bits,
+        "error_flag":         bool(val & (1 << 0)),
+        "spoofing_detected":  bool(val & (1 << 9)),
+        "jamming_detected":   bool(val & (1 << 15)),
+        "antenna_open":       bool(val & (1 << 5)),
+        "antenna_shorted":    bool(val & (1 << 6)),
+        "position_invalid":   bool(val & (1 << 19)),
+    }
+
+
+# ── AUX4 status bit decoder ───────────────────────────────────────────
+# Satellite tracking status lives in AUX4, not RXSTATUS.
+# Source: NovAtel OEM7 Firmware Reference Manual, RXSTATUS log, Table: Auxiliary 4 status.
+def decode_aux4_tracking(hex_str: str) -> dict:
+    """
+    Decode AUX4 status word for satellite tracking flags.
+
+    Returns:
+        tracking_degraded: bool  (AUX4 bit 0 — <60% of satellites tracked well)
+        tracking_critical: bool  (AUX4 bit 1 — <15% of satellites tracked well)
+    """
+    try:
+        val = int(hex_str.strip(), 16)
+    except (ValueError, AttributeError):
+        return {"tracking_degraded": False, "tracking_critical": False, "decode_error": True}
+
+    return {
+        "tracking_degraded": bool(val & (1 << 0)),  # <60% tracked well
+        "tracking_critical": bool(val & (1 << 1)),  # <15% tracked well
+    }
+
+
+# ── ITDETECTSTATUS ASCII parser ───────────────────────────────────────
+# Format after semicolon:
+#   <num_entries>, [<rf_path>, <detect_type>, <p1>, <p2>, <p3>, <p4>,
+#                   <res1>, <res2>, <res3>]  × num_entries
+#
+# Detection types (ASCII strings in the log):
+#   SPECTRUMANALYSIS    — p1=center_freq_MHz, p2=bandwidth_MHz,
+#                         p3=power_dBm, p4=peak_psd_dBm_Hz
+#   STATISTICALANALYSIS — p1..p4 are all reserved (do not parse them)
+#
+# RF path labels (ASCII): L1, L2, L5, LBAND
+#
+# Source: NovAtel OEM7 Firmware Reference Manual, ITDETECTSTATUS log.
+_ITDETECT_FIELDS_PER_ENTRY = 9   # rf_path, detect_type, p1, p2, p3, p4, res1, res2, res3
+
+
+def decode_itdetectstatus(payload: str) -> dict:
+    """
+    Parse the semicolon-payload of an ITDETECTSTATUS ASCII log line.
+
+    Parameters
+    ----------
+    payload : str
+        Everything after the ';' and before the '*' checksum.
+        e.g. "3,L1,STATISTICALANALYSIS,-0.718,29.167,0.126,12.797,
+               00000000,00000000,00000000,L2,SPECTRUMANALYSIS,..."
+
+    Returns
+    -------
+    dict with:
+        num_entries                 : int
+        entries                     : list of per-interference dicts
+        has_spectrum_interference   : bool  (any SPECTRUMANALYSIS entry)
+        has_statistical_interference: bool  (any STATISTICALANALYSIS entry)
+
+    Each entry dict contains:
+        rf_path     : "L1" | "L2" | "L5" | "LBAND"
+        detect_type : "SPECTRUMANALYSIS" | "STATISTICALANALYSIS"
+
+        For SPECTRUMANALYSIS only:
+            center_freq_mhz  : float  — center frequency in MHz
+            bandwidth_mhz    : float  — bandwidth in MHz
+            power_dbm        : float  — estimated power in dBm
+            peak_psd_dbm_hz  : float  — peak power spectral density in dBm/Hz
+
+        For STATISTICALANALYSIS:
+            (no parameters — all four are reserved per the manual)
+    """
+    parts = [p.strip() for p in payload.split(",")]
+
+    try:
+        num_entries = int(parts[0])
+    except (ValueError, IndexError):
+        return {"payload": payload, "decode_error": True}
+
+    entries = []
+    for i in range(num_entries):
+        base = 1 + i * _ITDETECT_FIELDS_PER_ENTRY
+        # Ensure all 9 fields for this entry exist before accessing
+        if base + _ITDETECT_FIELDS_PER_ENTRY - 1 >= len(parts):
+            break  # truncated log line
+
+        rf_path     = parts[base]
+        detect_type = parts[base + 1]
+
+        entry = {
+            "rf_path":     rf_path,      # "L1" | "L2" | "L5" | "LBAND"
+            "detect_type": detect_type,  # "SPECTRUMANALYSIS" | "STATISTICALANALYSIS"
+        }
+
+        if detect_type == "SPECTRUMANALYSIS":
+            try:
+                entry["center_freq_mhz"] = float(parts[base + 2])
+                entry["bandwidth_mhz"]   = float(parts[base + 3])
+                entry["power_dbm"]       = float(parts[base + 4])
+                entry["peak_psd_dbm_hz"] = float(parts[base + 5])
+            except ValueError:
+                entry["param_parse_error"] = True
+
+        elif detect_type == "STATISTICALANALYSIS":
+            # Parameters 1-4 are reserved for this type — do not parse them
+            pass
+
+        entries.append(entry)
+
+    return {
+        "num_entries": num_entries,
+        "entries":     entries,
+        "has_spectrum_interference":     any(
+            e["detect_type"] == "SPECTRUMANALYSIS"    for e in entries
+        ),
+        "has_statistical_interference":  any(
+            e["detect_type"] == "STATISTICALANALYSIS" for e in entries
+        ),
+    }
+
+
+# ── BESTPOS solution type parser ──────────────────────────────────────
+def decode_bestpos_fields(fields_raw: str) -> dict:
+    """Extract sol_status and pos_type from BESTPOS/BESTPOSA fields."""
+    parts = [p.strip() for p in fields_raw.split(",")]
+    return {
+        "sol_status": parts[0] if len(parts) > 0 else "",
+        "pos_type":   parts[1] if len(parts) > 1 else "",
+        "num_svs":    int(parts[11]) if len(parts) > 11 else None,
+    }
+
+
+def _summarize_log(df: pd.DataFrame, filename: str) -> str:
+    if df.empty:
+        return f"Uploaded file '{filename}' had no parseable NovAtel ASCII log lines."
+
+    log_counts = Counter(df["log_name_raw"])
+    top_logs   = ", ".join(f"{n}({c})" for n, c in log_counts.most_common(10))
+
+    VALID_TIME = {
+        "FINESTEERING", "FINE", "FINEBACKUPSTEERING",
+        "FINEADJUSTING", "COARSE", "COARSESTEERING",
+        "COARSEADJUSTING", "FREEWHEELING",
+    }
+    valid = df[df["time_status"].isin(VALID_TIME) & (df["week"] > 0)]
+
+    parts = [f"Log '{filename}': {len(df)} records, {len(log_counts)} distinct log types."]
+    parts.append(f"Top log types: {top_logs}.")
+
+    if not valid.empty:
+        weeks    = sorted(valid["week"].unique().tolist())
+        t_start  = valid["seconds"].min()
+        t_end    = valid["seconds"].max()
+        w_start  = int(valid.loc[valid["seconds"].idxmin(), "week"])
+        w_end    = int(valid.loc[valid["seconds"].idxmax(), "week"])
+        utc_start = gps_to_utc_str(w_start, t_start)
+        utc_end   = gps_to_utc_str(w_end,   t_end)
+
+        if len(weeks) == 1:
+            duration = t_end - t_start
+        else:
+            duration = (weeks[-1] - weeks[0]) * 604800 + (t_end - t_start)
+
+        parts.append(
+            f"File time range: {utc_start} to {utc_end} "
+            f"(GPS week(s) {weeks[0] if len(weeks)==1 else str(weeks[0])+'-'+str(weeks[-1])}, "
+            f"duration {duration:.1f} seconds = {duration/60:.2f} minutes)."
+        )
+
+        n_unknown = len(df) - len(valid)
+        if n_unknown > 0:
+            parts.append(
+                f"Also {n_unknown} records have no valid GPS time "
+                "(time_status UNKNOWN or SATTIME — boot-time config snapshots)."
+            )
+    else:
+        parts.append(
+            "No records have valid GPS time — all are boot-time config snapshots "
+            "(time_status UNKNOWN or SATTIME)."
+        )
+
+    return " ".join(parts)
+
+
+def _build_event_index(df: pd.DataFrame) -> dict:
+    """
+    Pre-compute structured event lists from RXSTATUS and ITDETECTSTATUS
+    so the agent never has to decode bits itself.
+
+    Event keys returned:
+        spoofing            — RXSTATUS bit 9
+        jamming             — RXSTATUS bit 15
+        antenna_open        — RXSTATUS bit 5
+        antenna_shorted     — RXSTATUS bit 6
+        position_invalid    — RXSTATUS bit 19
+        tracking_degraded   — AUX4 bit 0 (<60% satellites tracked well)
+        tracking_critical   — AUX4 bit 1 (<15% satellites tracked well)
+        itdetect_interference — any entry from ITDETECTSTATUS (all RF paths,
+                                 both SPECTRUMANALYSIS and STATISTICALANALYSIS)
+    """
+    events: dict[str, list] = {
+        "spoofing":               [],
+        "jamming":                [],
+        "antenna_open":           [],
+        "antenna_shorted":        [],
+        "position_invalid":       [],
+        "tracking_degraded":      [],   # AUX4 bit 0 — <60% satellites tracked well
+        "tracking_critical":      [],   # AUX4 bit 1 — <15% satellites tracked well
+        "itdetect_interference":  [],   # all ITDETECTSTATUS entries
+    }
+
+    # ── RXSTATUS events ───────────────────────────────────────────────
+    # The rx_status column in the DataFrame is field[6] of the log header,
+    # which is the RXSTATUS word. AUX4 is only available inside RXSTATUS log
+    # body fields — we parse the RXSTATUS log body below for AUX4.
+    rxs = df[df["log_name"] == "RXSTATUS"].copy()
+    for _, row in rxs.iterrows():
+        # rx_status (header field 6) carries the RXSTATUS word
+        decoded = decode_rxstatus(row.get("rx_status", ""))
+        ts   = row.get("utc_time", "") or f"GPS {row['week']}w {row['seconds']:.3f}s"
+        week = int(row["week"])
+        sow  = row["seconds"]
+        base = {
+            "utc_time": ts,
+            "week":     week,
+            "seconds":  sow,
+            "raw_hex":  decoded.get("raw_hex", ""),
+            "set_bits": decoded.get("set_bits", []),
+        }
+        if decoded.get("spoofing_detected"):  events["spoofing"].append(base)
+        if decoded.get("jamming_detected"):   events["jamming"].append(base)
+        if decoded.get("antenna_open"):       events["antenna_open"].append(base)
+        if decoded.get("antenna_shorted"):    events["antenna_shorted"].append(base)
+        if decoded.get("position_invalid"):   events["position_invalid"].append(base)
+
+        # AUX4 is the 5th status word in the RXSTATUS body.
+        # Body fields (fields_raw): rxstat, rxstat_pri, rxstat_set, rxstat_clr,
+        #   aux1stat, aux1_pri, aux1_set, aux1_clr,
+        #   aux2stat, aux2_pri, aux2_set, aux2_clr,
+        #   aux3stat, aux3_pri, aux3_set, aux3_clr,
+        #   aux4stat, aux4_pri, aux4_set, aux4_clr
+        # aux4stat is at index 16 (0-based) in fields_raw.
+        fields = [f.strip() for f in row.get("fields_raw", "").split(",")]
+        if len(fields) > 16:
+            aux4 = decode_aux4_tracking(fields[16])
+            if aux4.get("tracking_degraded"): events["tracking_degraded"].append(base)
+            if aux4.get("tracking_critical"): events["tracking_critical"].append(base)
+
+    # ── ITDETECTSTATUS events ─────────────────────────────────────────
+    # Each ITDETECTSTATUS log line can report multiple interference entries.
+    # We expand them: one event dict per entry (not per log line).
+    itd = df[df["log_name"].isin(["ITDETECTSTATUS", "ITDETECTSTAT"])].copy()
+    for _, row in itd.iterrows():
+        decoded = decode_itdetectstatus(row.get("fields_raw", ""))
+        if decoded.get("decode_error"):
+            continue
+
+        ts   = row.get("utc_time", "") or f"GPS {row['week']}w {row['seconds']:.3f}s"
+        week = int(row["week"])
+        sow  = row["seconds"]
+
+        for entry in decoded.get("entries", []):
+            event = {
+                "utc_time":    ts,
+                "week":        week,
+                "seconds":     sow,
+                "rf_path":     entry.get("rf_path", ""),
+                "detect_type": entry.get("detect_type", ""),
+            }
+            # Include SPECTRUMANALYSIS parameters if present
+            if entry.get("detect_type") == "SPECTRUMANALYSIS":
+                event["center_freq_mhz"] = entry.get("center_freq_mhz")
+                event["bandwidth_mhz"]   = entry.get("bandwidth_mhz")
+                event["power_dbm"]       = entry.get("power_dbm")
+                event["peak_psd_dbm_hz"] = entry.get("peak_psd_dbm_hz")
+
+            events["itdetect_interference"].append(event)
+
+    return events
+
+
+def ingest_log_file(file_bytes: bytes, filename: str, session_id: str) -> dict:
+    t0   = time.time()
+    text = file_bytes.decode("utf-8", errors="replace")
+    lines = [l for l in text.splitlines() if l.strip()]
+    print(f"[INGEST] File has {len(lines)} non-empty lines. First 10:")
+    for i, l in enumerate(lines[:10]):
+        print(f"  [{i}] {l[:300]}")
+    df = parse_novatel_ascii(text)
+
+    if df.empty:
+        sample = "\n".join(lines[:5])
+        raise ValueError(
+            f"No NovAtel ASCII log lines found in '{filename}'. "
+            f"Expected lines starting with '#LOGNAME,...;FIELDS*CRC'.\n"
+            f"First lines of file:\n{sample}"
+        )
+
+    summary = _summarize_log(df, filename)
+    events  = _build_event_index(df)
+    _log_store[session_id] = {
+        "df":       df,
+        "summary":  summary,
+        "filename": filename,
+        "events":   events,
+    }
+    print(f"[INGEST] {filename} parsed {len(df)} records, session={session_id}, took={time.time()-t0:.2f}s")
+    return {
+        "filename":  filename,
+        "records":   len(df),
+        "log_types": int(df["log_name"].nunique()) if not df.empty else 0,
+        "summary":   summary,
+    }
+
+
+# ── Per-request session context ───────────────────────────────────────
+# Fix: use contextvars.ContextVar instead of a module-level mutable dict
+# so concurrent async requests each see their own session_id without
+# one request overwriting another's value mid-flight.
+_current_session_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_current_session_var", default=""
+)
+
+
+def _get_session_entry() -> dict | None:
+    """Return the _log_store entry for the current request's session, or None."""
+    return _log_store.get(_current_session_var.get(""))
+
+
+# ── Jamming/Spoofing event merger ─────────────────────────────────────
+def _merge_jamming_events(rxstatus_events: list, itdetect_events: list) -> list:
+    """
+    Merge RXSTATUS and ITDETECTSTATUS events that share the same (week, seconds)
+    GPS timestamp into a single combined entry. Events that do not share a
+    timestamp with any entry from the other source are kept as their own entry.
+
+    Returns a list of merged event dicts sorted by (week, seconds).
+
+    Each merged entry contains:
+        utc_time         : ISO-8601 UTC string
+        week             : int GPS week
+        seconds          : float GPS seconds-of-week
+        sources          : list — subset of ["rxstatus", "itdetectstatus"]
+                           ["rxstatus", "itdetectstatus"] = confirmed by both
+                           ["rxstatus"]                   = RXSTATUS-only
+                           ["itdetectstatus"]             = ITDETECTSTATUS-only
+        rxstatus_bits    : list of {bit, name} dicts from RXSTATUS (empty if
+                           source is ITDETECTSTATUS-only)
+        itdetect_entries : list of per-RF-path interference dicts from
+                           ITDETECTSTATUS (empty if source is RXSTATUS-only)
+    """
+    merged: dict[tuple, dict] = {}
+
+    for ev in rxstatus_events:
+        key = (int(ev.get("week", 0)), float(ev.get("seconds", 0.0)))
+        if key not in merged:
+            merged[key] = {
+                "utc_time":         ev.get("utc_time", ""),
+                "week":             key[0],
+                "seconds":          key[1],
+                "sources":          [],
+                "rxstatus_bits":    [],
+                "itdetect_entries": [],
+            }
+        if "rxstatus" not in merged[key]["sources"]:
+            merged[key]["sources"].append("rxstatus")
+        merged[key]["rxstatus_bits"].extend(ev.get("set_bits", []))
+
+    for ev in itdetect_events:
+        key = (int(ev.get("week", 0)), float(ev.get("seconds", 0.0)))
+        if key not in merged:
+            merged[key] = {
+                "utc_time":         ev.get("utc_time", ""),
+                "week":             key[0],
+                "seconds":          key[1],
+                "sources":          [],
+                "rxstatus_bits":    [],
+                "itdetect_entries": [],
+            }
+        if "itdetectstatus" not in merged[key]["sources"]:
+            merged[key]["sources"].append("itdetectstatus")
+
+        entry = {
+            "rf_path":     ev.get("rf_path", ""),
+            "detect_type": ev.get("detect_type", ""),
+        }
+        if ev.get("detect_type") == "SPECTRUMANALYSIS":
+            for f in ("center_freq_mhz", "bandwidth_mhz", "power_dbm", "peak_psd_dbm_hz"):
+                if f in ev:
+                    entry[f] = ev[f]
+        merged[key]["itdetect_entries"].append(entry)
+
+    return sorted(merged.values(), key=lambda e: (e["week"], e["seconds"]))
+
+
+# ── Field stats helper ────────────────────────────────────────────────
+def _compute_field_stats(filtered: pd.DataFrame) -> dict:
+    """
+    Compute per-field-position min/max statistics over ALL rows in `filtered`,
+    returning the full record for each extreme so the agent never needs to
+    scan records[] itself.
+
+    Only positions where at least one row has a parseable float are included.
+
+    Returns a dict keyed by field position (as string, e.g. "4"):
+        {
+          "min":        float,
+          "max":        float,
+          "min_record": { log_name, utc_time, week, seconds, fields_parsed, fields_raw },
+          "max_record": { ... }
+        }
+
+    This is computed BEFORE _cap_tool_response so it is never trimmed.
+    """
+    if filtered.empty:
+        return {}
+
+    # Parse every fields_raw into a list of floats (None where not parseable)
+    def _to_floats(raw: str) -> list:
+        result = []
+        for p in raw.split(","):
+            try:
+                result.append(float(p.strip()))
+            except ValueError:
+                result.append(None)
+        return result
+
+    parsed_cols = filtered["fields_raw"].apply(_to_floats).tolist()
+    if not parsed_cols:
+        return {}
+
+    max_len = max(len(r) for r in parsed_cols)
+    stats: dict[str, dict] = {}
+
+    for pos in range(max_len):
+        col_vals = []
+        for i, row_vals in enumerate(parsed_cols):
+            v = row_vals[pos] if pos < len(row_vals) else None
+            col_vals.append(v)
+
+        numeric = [(i, v) for i, v in enumerate(col_vals) if v is not None]
+        if not numeric:
+            continue
+
+        min_i, min_v = min(numeric, key=lambda x: x[1])
+        max_i, max_v = max(numeric, key=lambda x: x[1])
+
+        def _make_rec(idx: int) -> dict:
+            row = filtered.iloc[idx]
+            raw = row.get("fields_raw", "")
+            return {
+                "log_name":      row["log_name"],
+                "utc_time":      row.get("utc_time", ""),
+                "week":          int(row["week"]),
+                "seconds":       float(row["seconds"]),
+                "fields_raw":    raw,
+                "fields_parsed": [f.strip() for f in raw.split(",")],
+            }
+
+        stats[str(pos)] = {
+            "min":        min_v,
+            "max":        max_v,
+            "min_record": _make_rec(min_i),
+            "max_record": _make_rec(max_i),
+        }
+
+    return stats
+
+
+# ── Tools ─────────────────────────────────────────────────────────────
+@tool
+def kb_retriever(query: str, max_results: int = MAX_RESULTS) -> dict:
+    """
+    Search the NovAtel OEM7 documentation knowledge base. Use this for
+    questions about commands, log formats, bit definitions, etc.
+    """
+    t0 = time.time()
+    try:
+        response = get_kb_client().retrieve(
+            knowledgeBaseId=KB_ID,
+            retrievalQuery={"text": query},
+            retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": max_results}},
+        )
+        elements = []
+        for result in response.get("retrievalResults", []):
+            content  = result.get("content", {}).get("text", "")
+            metadata = result.get("metadata", {})
+            elements.append({
+                "element_id":       metadata.get("element_id", ""),
+                "element_type":     metadata.get("element_type", ""),
+                "content_markdown": content,
+                "page_number":      int(metadata.get("page_number", 0)),
+                "score":            result.get("score", 0.0),
+                "source_uri":       metadata.get("x-amz-bedrock-kb-source-uri", ""),
+                "csv_source_uri":   metadata.get("csv_source_uri", ""),
+            })
+        payload = {"status": "success", "elements": elements, "total_found": len(elements)}
+        _tool_call_log.append({"tool": "kb_retriever", "result": payload})
+        print(f"[KB] query='{query}' results={len(elements)} took={time.time()-t0:.2f}s")
+        return payload
+    except Exception as e:
+        print(f"[KB] error: {e}")
+        return {"status": "error", "error": str(e), "elements": [], "total_found": 0}
+
+
+@tool
+def context_expander(
+    source_uri: str,
+    element_ids: list = None,
+    page_numbers: list = None,
+    expansion_pages: int = EXPANSION_PAGES,
+) -> dict:
+    """Expand context around specific KB elements. Use csv_source_uri from kb_retriever."""
+    t0 = time.time()
+    try:
+        source_uri = _resolve_data_uri(source_uri)
+        df = _download_and_parse(source_uri)
+        target_pages: set[int] = set()
+        if element_ids:
+            for eid in element_ids:
+                rows = df[df["element_id"] == eid]
+                if not rows.empty:
+                    target_pages.update(rows["page_number"].tolist())
+        if page_numbers:
+            target_pages.update(page_numbers)
+        all_pages = {
+            i for p in target_pages
+            for i in range(p - expansion_pages, p + expansion_pages + 1)
+            if i >= 0
+        }
+        filtered = df[df["page_number"].isin(all_pages)].copy()
+        for col in ["page_number"]:
+            if col in filtered.columns:
+                filtered[col] = pd.to_numeric(filtered[col], errors="coerce").fillna(0).astype(int)
+        for col in [c for c in filtered.columns if c != "page_number"]:
+            filtered[col] = filtered[col].fillna("").astype(str)
+        available_cols = [c for c in _LLM_COLS if c in filtered.columns]
+        slim = filtered[available_cols].to_dict("records") if available_cols else []
+        print(f"[CSV] expander pages={sorted(all_pages)} elements={len(slim)} took={time.time()-t0:.2f}s")
+        return {"status": "success", "elements": slim, "total_found": len(slim)}
+    except Exception as e:
+        print(f"[CSV] error: {e}")
+        return {"status": "error", "error": str(e), "elements": [], "total_found": 0}
+
+
+@tool
+def list_log_types() -> dict:
+    """
+    List all log types present in the uploaded file with their exact record counts
+    and the file's overall time range (UTC start, UTC end, duration).
+
+    Use this first when the user asks:
+    - 'What logs are in this file?'
+    - 'What data is available?'
+    - 'Give me a summary of the file'
+    - Any question where you need to know which log type to query next.
+
+    Returns exact counts per log type and file time metadata.
+    """
+    entry = _get_session_entry()
+    if not entry:
+        return {"status": "error", "error": "No log file has been uploaded in this session."}
+    df = entry["df"]
+    if df.empty:
+        return {"status": "error", "error": "Uploaded log had no parseable records."}
+
+    log_counts = df.groupby("log_name_raw").size().sort_values(ascending=False).to_dict()
+
+    VALID_TIME = {
+        "FINESTEERING", "FINE", "FINEBACKUPSTEERING",
+        "FINEADJUSTING", "COARSE", "COARSESTEERING",
+        "COARSEADJUSTING", "FREEWHEELING",
+    }
+    valid = df[df["time_status"].isin(VALID_TIME) & (df["week"] > 0)]
+    if not valid.empty:
+        w_start  = int(valid.loc[valid["seconds"].idxmin(), "week"])
+        w_end    = int(valid.loc[valid["seconds"].idxmax(), "week"])
+        s_start  = float(valid["seconds"].min())
+        s_end    = float(valid["seconds"].max())
+        weeks    = sorted(valid["week"].unique().tolist())
+        duration = (
+            (weeks[-1] - weeks[0]) * 604800 + (s_end - s_start)
+            if len(weeks) > 1
+            else s_end - s_start
+        )
+        file_time_info = {
+            "utc_start":         gps_to_utc_str(w_start, s_start),
+            "utc_end":           gps_to_utc_str(w_end,   s_end),
+            "gps_week":          w_start if w_start == w_end else f"{w_start}-{w_end}",
+            "gps_seconds_start": round(s_start, 3),
+            "gps_seconds_end":   round(s_end, 3),
+            "duration_seconds":  round(duration, 3),
+            "duration_minutes":  round(duration / 60, 4),
+        }
+    else:
+        file_time_info = {"note": "No valid GPS time records in file."}
+
+    log_lines      = [f"{name}: {count}" for name, count in log_counts.items()]
+    log_counts_text = "\n".join(log_lines)
+
+    return {
+        "status":             "success",
+        "filename":           entry["filename"],
+        "total_records":      len(df),
+        "distinct_log_types": len(log_counts),
+        "log_counts_text":    log_counts_text,
+        "file_time_info":     file_time_info,
+    }
+
+
+@tool
+def query_log(
+    log_name: str = None,
+    time_from: float = None,
+    time_to: float = None,
+    field_contains: str = None,
+    freq_mhz: float = None,
+    limit: int = None,
+) -> dict:
+    """
+    Fetch records from the uploaded NovAtel ASCII log file.
+
+    Use this to get actual data records for any log type. Each record includes:
+    - utc_time: pre-computed UTC timestamp (ISO-8601) — use this directly
+    - fields_parsed: list of field values split from the raw payload
+    - fields_raw: original comma-separated field string
+    - rx_status: hex status word from the message header
+
+    Args:
+        log_name: log type to fetch (e.g. 'BESTPOS', 'TRACKSTAT', 'HEADING2',
+                  'RXSTATUS', 'ITDETECTSTATUS', 'RANGE', 'SATVIS2', etc.).
+                  Case-insensitive. None = all log types (use with a limit).
+        time_from: filter to records with GPS seconds-of-week >= this value.
+        time_to:   filter to records with GPS seconds-of-week <= this value.
+        field_contains: substring match anywhere in the fields payload.
+        freq_mhz: frequency in MHz to search for in ITDETECTSTATUS records
+                  (e.g. 1575.42 for GPS L1). Searches center_freq_mhz stored
+                  as MHz in fields_raw with ±1 MHz tolerance. Use this instead
+                  of field_contains for frequency questions.
+        limit: max records to return.
+               OMIT (or pass None) for aggregate queries such as
+               highest / lowest / peak / minimum / maximum / count — this
+               returns ALL matching records so the answer is always correct.
+               Only pass an explicit integer when you genuinely want a preview
+               or a fixed-size sample (e.g. "show me the first 5 records").
+
+    Returns:
+        total_matching  : exact count of all records matching the filters.
+                          Use this for count questions — never count records[].
+        returned        : number of records actually included in this response.
+                          If returned < total_matching, results were truncated
+                          by an explicit limit — re-call without limit to get all.
+        records         : list of matching records (all of them when limit=None).
+        truncated       : true only when an explicit limit caused truncation.
+        field_stats     : server-side min/max computed over ALL matching records
+                          BEFORE any size capping. Keyed by field position (string).
+                          Each entry: {min, max, min_record, max_record}.
+                          ALWAYS use field_stats for highest/lowest/peak/minimum/
+                          maximum questions — never scan records[] yourself.
+                          Example: field_stats["4"]["max"] = peak value at field[4],
+                                   field_stats["4"]["max_record"] = full record for it.
+
+    IMPORTANT:
+        - total_matching is the exact count for the whole filter.
+        - Never count the records list — it may be truncated when limit is set.
+        - For min/max/peak/aggregate questions ALWAYS use field_stats — it covers
+          every record regardless of how many records[] were returned.
+        - field_stats is NEVER trimmed by size capping — it is always complete.
+    """
+    t0 = time.time()
+    entry = _get_session_entry()
+    if not entry:
+        return {"status": "error", "error": "No log file has been uploaded in this session."}
+    df = entry["df"]
+    if df.empty:
+        return {"status": "error", "error": "Uploaded log had no parseable records."}
+
+    # ── Frequency search ──────────────────────────────────────────────
+    # Fix: ITDETECTSTATUS stores center_freq_mhz as a float in MHz (e.g. "1249.961"),
+    # NOT as Hz. Search in MHz with ±1 MHz tolerance.
+    if freq_mhz is not None:
+        tolerance_mhz = 1.0
+        target_log    = log_name or "ITDETECTSTATUS"
+
+        def _freq_match_mhz(fields_raw: str) -> bool:
+            for p in fields_raw.split(","):
+                try:
+                    if abs(float(p.strip()) - freq_mhz) <= tolerance_mhz:
+                        return True
+                except ValueError:
+                    continue
+            return False
+
+        filtered = df[df["log_name"].str.upper() == target_log.upper()].copy()
+        if time_from is not None:
+            filtered = filtered[filtered["seconds"] >= time_from]
+        if time_to is not None:
+            filtered = filtered[filtered["seconds"] <= time_to]
+        filtered = filtered[filtered["fields_raw"].apply(_freq_match_mhz)]
+
+        total     = len(filtered)
+        truncated = limit is not None and total > limit
+        trimmed   = filtered.head(limit) if limit is not None else filtered
+
+        # Compute stats over ALL matching records before any size cap
+        field_stats = _compute_field_stats(filtered)
+
+        records = [
+            {
+                "log_name":      row["log_name"],
+                "utc_time":      row.get("utc_time", ""),
+                "seconds":       row["seconds"],
+                "week":          int(row["week"]),
+                "time_status":   row.get("time_status", ""),
+                "rx_status":     row.get("rx_status", ""),
+                "fields_raw":    row.get("fields_raw", ""),
+                "fields_parsed": [f.strip() for f in row.get("fields_raw", "").split(",")],
+            }
+            for _, row in trimmed.iterrows()
+        ]
+
+        result = {
+            "status":            "success",
+            "freq_searched_mhz": freq_mhz,
+            "tolerance_mhz":     tolerance_mhz,
+            "total_matching":    total,
+            "returned":          len(records),
+            "truncated":         truncated,
+            "field_stats":       field_stats,
+            "records":           records,
+        }
+        if truncated:
+            result["warning"] = (
+                f"Results truncated to {limit} of {total}. "
+                f"Re-call without limit to get all records. "
+                f"Use field_stats for min/max answers — it covers all {total} records."
+            )
+
+        print(
+            f"[QUERY_LOG] freq_mhz={freq_mhz} ±{tolerance_mhz} MHz "
+            f"total={total} returned={len(records)} took={time.time()-t0:.2f}s"
+        )
+        return _cap_tool_response(result)
+
+    # ── Standard filter ───────────────────────────────────────────────
+    filtered = df
+    if log_name:
+        filtered = filtered[filtered["log_name"].str.upper() == log_name.upper()]
+    if time_from is not None:
+        filtered = filtered[filtered["seconds"] >= time_from]
+    if time_to is not None:
+        filtered = filtered[filtered["seconds"] <= time_to]
+    if field_contains:
+        filtered = filtered[filtered["fields_raw"].str.contains(field_contains, case=False, na=False)]
+
+    total     = len(filtered)
+    truncated = limit is not None and total > limit
+    trimmed   = filtered.head(limit) if limit is not None else filtered
+
+    # Compute stats over ALL matching records before any size cap
+    field_stats = _compute_field_stats(filtered)
+
+    records = []
+    for _, row in trimmed.iterrows():
+        fields_raw = row.get("fields_raw", "")
+        records.append({
+            "log_name":      row["log_name"],
+            "utc_time":      row.get("utc_time", ""),
+            "seconds":       row["seconds"],
+            "week":          int(row["week"]),
+            "time_status":   row.get("time_status", ""),
+            "rx_status":     row.get("rx_status", ""),
+            "fields_raw":    fields_raw,
+            "fields_parsed": [f.strip() for f in fields_raw.split(",")],
+        })
+
+    result = {
+        "status":         "success",
+        "total_matching": total,
+        "returned":       len(records),
+        "truncated":      truncated,
+        "field_stats":    field_stats,
+        "records":        records,
+    }
+    if truncated:
+        result["warning"] = (
+            f"Results truncated to {limit} of {total}. "
+            f"Re-call without limit to get all records. "
+            f"Use field_stats for min/max answers — it covers all {total} records."
+        )
+
+    print(
+        f"[QUERY_LOG] log_name={log_name} contains={field_contains} "
+        f"total={total} returned={len(records)} took={time.time()-t0:.2f}s"
+    )
+    return _cap_tool_response(result)
+
+
+@tool
+def analyze_events(event_type: str) -> dict:
+    """
+    Return pre-decoded security/quality events from the uploaded log.
+    Use this for questions about spoofing, jamming, interference, antenna issues,
+    satellite tracking, or position validity. This tool decodes RXSTATUS bits
+    and ITDETECTSTATUS fields — do NOT try to decode hex values yourself.
+
+    Args:
+        event_type: one of:
+            'spoofing'              — RXSTATUS bit 9 set (spoofing detection status)
+            'jamming'               — RXSTATUS bit 15 set (jammer detected)
+            'antenna_open'          — RXSTATUS bit 5 set (primary antenna open circuit)
+            'antenna_shorted'       — RXSTATUS bit 6 set (primary antenna short circuit)
+            'position_invalid'      — RXSTATUS bit 19 set (position solution invalid)
+            'tracking_degraded'     — AUX4 bit 0 set (<60% of satellites tracked well)
+            'tracking_critical'     — AUX4 bit 1 set (<15% of satellites tracked well)
+            'itdetect_interference' — any interference entry from ITDETECTSTATUS
+                                      (SPECTRUMANALYSIS or STATISTICALANALYSIS on
+                                       any RF path: L1, L2, L5, LBAND)
+            'all'                   — summary counts of all event types above
+
+    Returns for 'jamming' and 'spoofing':
+        Merged event list where RXSTATUS and ITDETECTSTATUS events at the same
+        GPS timestamp are combined into a single entry (no double-counting).
+        Each entry has:
+            utc_time         : ISO-8601 UTC
+            week / seconds   : GPS time
+            sources          : ["rxstatus"] | ["itdetectstatus"] | ["rxstatus","itdetectstatus"]
+            rxstatus_bits    : set bits from RXSTATUS (empty if ITDETECTSTATUS-only)
+            itdetect_entries : list of RF-path interference dicts (empty if RXSTATUS-only)
+        total_unique_events  : true unique count after merging (use this, not sum of sub-counts)
+        both_sources_count   : events confirmed by both RXSTATUS and ITDETECTSTATUS
+        rxstatus_only_count  : events seen only in RXSTATUS
+        itdetectstatus_only_count: events seen only in ITDETECTSTATUS
+
+    Returns for other event types:
+        event list with utc_time, gps week/seconds, and decoded fields.
+        Each entry has a real UTC timestamp — report these directly to the user.
+
+    Notes on ITDETECTSTATUS:
+        This log does NOT label events as "jamming" or "spoofing" explicitly.
+        It reports interference entries per RF path with detection type
+        (SPECTRUMANALYSIS or STATISTICALANALYSIS) and, for SPECTRUMANALYSIS,
+        parameters: center_freq_MHz, bandwidth_MHz, power_dBm, peak_psd_dBm_Hz.
+        Use 'itdetect_interference' to retrieve all such entries.
+    """
+    entry = _get_session_entry()
+    if not entry:
+        return {"status": "error", "error": "No log file has been uploaded in this session."}
+
+    events = entry.get("events", {})
+
+    if event_type == "all":
+        summary = {k: len(v) for k, v in events.items()}
+        return {"status": "success", "event_type": "all", "summary": summary}
+
+    # ── Jamming: merge RXSTATUS bit 15 + ITDETECTSTATUS by timestamp ──
+    if event_type == "jamming":
+        merged   = _merge_jamming_events(
+            events.get("jamming", []),
+            events.get("itdetect_interference", []),
+        )
+        both     = [e for e in merged if "rxstatus" in e["sources"] and "itdetectstatus" in e["sources"]]
+        rx_only  = [e for e in merged if e["sources"] == ["rxstatus"]]
+        itd_only = [e for e in merged if e["sources"] == ["itdetectstatus"]]
+        MAX_EVENTS = 50
+        return _cap_tool_response({
+            "status":                      "success",
+            "event_type":                  "jamming",
+            "total_unique_events":         len(merged),
+            "rxstatus_only_count":         len(rx_only),
+            "itdetectstatus_only_count":   len(itd_only),
+            "both_sources_count":          len(both),
+            "events":                      merged[:MAX_EVENTS],
+            "truncated":                   len(merged) > MAX_EVENTS,
+            "note": (
+                f"{len(merged)} unique jamming events after merging same-timestamp entries. "
+                f"{len(both)} confirmed by both RXSTATUS bit 15 AND ITDETECTSTATUS, "
+                f"{len(rx_only)} RXSTATUS-only, {len(itd_only)} ITDETECTSTATUS-only. "
+                "Use total_unique_events as the authoritative count — not the sum of sub-counts."
+            ),
+        })
+
+    # ── Spoofing: merge RXSTATUS bit 9 + ITDETECTSTATUS by timestamp ──
+    if event_type == "spoofing":
+        merged   = _merge_jamming_events(
+            events.get("spoofing", []),
+            events.get("itdetect_interference", []),
+        )
+        both     = [e for e in merged if "rxstatus" in e["sources"] and "itdetectstatus" in e["sources"]]
+        rx_only  = [e for e in merged if e["sources"] == ["rxstatus"]]
+        itd_only = [e for e in merged if e["sources"] == ["itdetectstatus"]]
+        MAX_EVENTS = 50
+        return _cap_tool_response({
+            "status":                      "success",
+            "event_type":                  "spoofing",
+            "total_unique_events":         len(merged),
+            "rxstatus_only_count":         len(rx_only),
+            "itdetectstatus_only_count":   len(itd_only),
+            "both_sources_count":          len(both),
+            "events":                      merged[:MAX_EVENTS],
+            "truncated":                   len(merged) > MAX_EVENTS,
+            "note": (
+                f"{len(merged)} unique spoofing-related events after merging same-timestamp entries. "
+                f"{len(both)} confirmed by both RXSTATUS bit 9 AND ITDETECTSTATUS, "
+                f"{len(rx_only)} RXSTATUS-only, {len(itd_only)} ITDETECTSTATUS-only. "
+                "Use total_unique_events as the authoritative count — not the sum of sub-counts."
+            ),
+        })
+
+    if event_type not in events:
+        valid_types = sorted(events.keys()) + ["all"]
+        return {
+            "status": "error",
+            "error":  f"Unknown event_type '{event_type}'. Valid: {valid_types}",
+        }
+
+    result     = events[event_type]
+    MAX_EVENTS = 50
+    return _cap_tool_response({
+        "status":       "success",
+        "event_type":   event_type,
+        "total_events": len(result),
+        "events":       result[:MAX_EVENTS],
+        "truncated":    len(result) > MAX_EVENTS,
+        "note": (
+            f"Total occurrences: {len(result)}. utc_time is pre-computed — report directly."
+            + (f" Showing first {MAX_EVENTS}." if len(result) > MAX_EVENTS else "")
+        ),
+    })
+
+
+# ── Agent system prompt ───────────────────────────────────────────────
+_AGENT_SYSTEM_PROMPT = """You are a NovAtel OEM7 assistant. Answer questions about NovAtel documentation OR an uploaded ASCII log file.
+
+TOOLS:
+- list_log_types(): all log types + counts + file UTC/GPS start/end/duration. Use for "what logs", "summary", "start time", "end time", "duration".
+- query_log(log_name, time_from, time_to, field_contains, freq_mhz, limit=None): fetch records. Returns utc_time + fields_parsed per record, PLUS field_stats.
+  Use freq_mhz (float, in MHz) when the user asks about a specific frequency — e.g. "1575 MHz" → freq_mhz=1575.0. Searches ITDETECTSTATUS center_freq_mhz with ±1 MHz tolerance.
+  FIELD_STATS — use this for ALL aggregate questions (highest/lowest/peak/min/max):
+    field_stats is computed server-side over EVERY matching record before any size cap.
+    It is keyed by field position (string): field_stats["0"], field_stats["4"], etc.
+    Each position has: {min, max, min_record, max_record} where min_record/max_record
+    are the complete records (with utc_time, fields_parsed) at those extremes.
+    ALWAYS use field_stats["N"]["max"] / field_stats["N"]["min"] for peak/lowest questions.
+    NEVER scan records[] for min/max — records[] may be size-capped and incomplete.
+    To find which field index holds MSL height, latitude, etc: look at field_stats keys
+    and cross-reference with the first record's fields_parsed positions.
+  LIMIT RULES:
+    • OMIT limit entirely (default None = all records) for ANY aggregate query.
+    • Only pass an explicit integer limit when the user asks for a sample/preview.
+    • If truncated=true or warning is present in the response, use field_stats —
+      it is always complete even when records[] is trimmed.
+- analyze_events(event_type): pre-decoded RXSTATUS/ITDETECTSTATUS events.
+  Valid event_type values:
+    spoofing            — RXSTATUS bit 9
+    jamming             — RXSTATUS bit 15
+    antenna_open        — RXSTATUS bit 5
+    antenna_shorted     — RXSTATUS bit 6
+    position_invalid    — RXSTATUS bit 19
+    tracking_degraded   — AUX4 bit 0 (<60% satellites tracked well)
+    tracking_critical   — AUX4 bit 1 (<15% satellites tracked well)
+    itdetect_interference — all ITDETECTSTATUS interference entries
+    all                 — summary counts of all the above
+  NOTE for jamming/spoofing: events at the same GPS timestamp from RXSTATUS and
+  ITDETECTSTATUS are merged into one entry. Use total_unique_events as the count —
+  never add rxstatus_only_count + itdetectstatus_only_count + both_sources_count.
+- kb_retriever(query): search NovAtel OEM7 documentation.
+- context_expander(csv_source_uri, element_ids): expand KB chunks.
+
+ROUTING:
+- "what logs are in this file" / "list all logs" / "what data is available" / "what log types" → list_log_types() and return the full table
+- "give me X logs" / "show me X logs" / "what are the X logs" / "position logs" / "velocity logs" → user wants RECORDS, not a file inventory. Call query_log(log_name=...) directly. Never call list_log_types() for these.
+- Log counts / file time / duration → list_log_types()
+- Spoofing / jamming / interference / antenna / tracking → analyze_events() — one call covers both RXSTATUS and ITDETECTSTATUS.
+- Any log records → query_log(log_name=...)
+- Unknown which log → list_log_types() first, then query_log()
+- Doc question only → kb_retriever()
+- "Explain fields in my log" → query_log() then kb_retriever()
+
+INTENT DISAMBIGUATION — critical:
+- "give me / show me / what are the [topic] logs" = show RECORDS. Use query_log().
+  Examples: "position logs" → query_log(log_name="BESTPOS")
+            "velocity logs" → query_log(log_name="BESTVEL")
+            "time logs"     → query_log(log_name="TIME")
+- "what logs are in this file" = show INVENTORY. Use list_log_types().
+- NEVER return the full log type inventory when the user asks about a specific topic.
+
+ANSWERING LOG QUESTIONS:
+- Always report UTC timestamps from utc_time field directly. Never recalculate from GPS seconds.
+- Match the scope of the answer to the question. If the user asks "show me 5 BESTPOS records", just show 5 records — do not add summaries or patterns.
+- Only report first/last occurrence, duration, and event patterns when the user explicitly asks about events.
+- Only call analyze_events() when the question is specifically about interference, spoofing, jamming, antenna faults, or tracking loss.
+- If total_matching > returned, say "Showing X of Y matching records" so the user knows results are partial.
+- For "summarize my log" or "what happened in this log": call list_log_types(), then analyze_events("all").
+
+RULES:
+- utc_time in every record is pre-computed. NEVER recalculate it yourself.
+- file_time_info has utc_start, utc_end, gps_week, gps_seconds_start, gps_seconds_end — report these directly.
+- total_matching from query_log = exact count. Never count records[] yourself.
+- log_counts_text from list_log_types() = exact counts. Read it directly.
+- field_stats from query_log = server-side min/max over ALL records. ALWAYS use for peak/lowest/highest/min/max questions. Never scan records[] for these.
+- Max 4 tool calls. Answer only from tool results, never from training knowledge about field values.
+- If a question needs both log data and documentation, use up to 2 log tools + 1 kb_retriever.
+- For min/max/peak/aggregate questions: use field_stats from query_log. If truncated=true or warning is present, field_stats is still complete — use it directly without re-calling.
+"""
+
+
+# ── Tool response size guard ──────────────────────────────────────────
+_MAX_TOOL_RESPONSE_CHARS = 12000
+
+
+def _cap_tool_response(response: dict) -> dict:
+    """
+    Hard-cap the JSON-serialised tool response to _MAX_TOOL_RESPONSE_CHARS.
+    Trims the largest collection field iteratively until it fits.
+    Always preserves scalar fields (strings, numbers, booleans).
+
+    IMPORTANT: if records[] is trimmed, sets truncated=True and adds a warning
+    so the agent knows it has a partial record set and must use field_stats for
+    any min/max/aggregate answer.
+    field_stats is a dict of scalars/small dicts — it is excluded from trimming
+    so aggregate answers are always correct.
+    """
+    serialised = json.dumps(response)
+    if len(serialised) <= _MAX_TOOL_RESPONSE_CHARS:
+        return response
+
+    result = dict(response)
+    records_were_trimmed = False
+
+    for _ in range(20):
+        if len(json.dumps(result)) <= _MAX_TOOL_RESPONSE_CHARS:
+            break
+        biggest_key  = None
+        biggest_size = 0
+        for k, v in result.items():
+            # Never trim field_stats — it must always be complete for aggregate answers
+            if k == "field_stats":
+                continue
+            if isinstance(v, (list, dict)):
+                s = len(json.dumps(v))
+                if s > biggest_size:
+                    biggest_size = s
+                    biggest_key  = k
+        if biggest_key is None:
+            break
+        val = result[biggest_key]
+        original_len = len(val) if isinstance(val, (list, dict)) else 0
+        if isinstance(val, dict):
+            items = sorted(
+                val.items(),
+                key=lambda x: (x[1] if isinstance(x[1], (int, float)) else 0),
+                reverse=True,
+            )
+            result[biggest_key] = dict(items[:max(1, len(items) // 2)])
+            result["_note"] = f"{biggest_key} trimmed to {len(result[biggest_key])} of {original_len} entries"
+        elif isinstance(val, list):
+            result[biggest_key] = val[:max(1, len(val) // 2)]
+            result["_note"] = f"{biggest_key} trimmed to {len(result[biggest_key])} of {original_len} entries"
+            if biggest_key == "records":
+                records_were_trimmed = True
+
+    if records_were_trimmed:
+        result["truncated"] = True
+        total = result.get("total_matching", "?")
+        kept  = len(result.get("records", []))
+        result["warning"] = (
+            f"records[] trimmed to {kept} of {total} by size cap. "
+            f"Use field_stats for min/max/aggregate answers — it covers all {total} records "
+            f"and is never trimmed."
+        )
+
+    final = json.dumps(result)
+    print(f"[TOOL_CAP] {len(serialised)} → {len(final)} chars records_trimmed={records_were_trimmed}")
+    return result
+
+
+# ── Agent factory ─────────────────────────────────────────────────────
+_agent = None
+
+
+def get_agent():
+    global _agent
+    if _agent is None:
+        _agent = create_react_agent(
+            model=get_llm(),
+            tools=[list_log_types, query_log, analyze_events, kb_retriever, context_expander],
+        )
+    return _agent
+
+
+def run_agent(prompt: str, history: list) -> str:
+    t0 = time.time()
+    _tool_call_log.clear()
+    messages    = [SystemMessage(content=_AGENT_SYSTEM_PROMPT)] + history + [HumanMessage(content=prompt)]
+    total_chars = sum(len(m.content) if isinstance(m.content, str) else 0 for m in messages)
+    print(f"[AGENT] input: {len(messages)} messages, ~{total_chars} chars, ~{total_chars//4} tokens")
+    for i, m in enumerate(messages):
+        c = m.content if isinstance(m.content, str) else str(m.content)
+        print(f"  [{i}] {type(m).__name__}: {len(c)} chars")
+    try:
+        result = get_agent().invoke(
+            {"messages": messages},
+            config={"recursion_limit": 12},
+        )
+        answer = result["messages"][-1].content
+        print(f"[AGENT] took={time.time()-t0:.2f}s answer_len={len(answer)}")
+        return answer
+    except Exception as e:
+        err = str(e)
+        if "Input is too long" in err or "ValidationException" in err:
+            print("[AGENT] token overflow, retrying without history")
+            messages_slim = [SystemMessage(content=_AGENT_SYSTEM_PROMPT), HumanMessage(content=prompt)]
+            try:
+                result = get_agent().invoke(
+                    {"messages": messages_slim},
+                    config={"recursion_limit": 12},
+                )
+                answer = result["messages"][-1].content
+                print(f"[AGENT] retry ok took={time.time()-t0:.2f}s")
+                return answer
+            except Exception as e2:
+                print(f"[AGENT] retry also failed: {e2}")
+                raise e2
+        print(f"[AGENT] error after {time.time()-t0:.2f}s: {e}")
+        raise
+
+
+# ── Main entrypoint ───────────────────────────────────────────────────
+def upload_to_s3(content: bytes, filename: str) -> str:
+    key = f"logs/{filename}"
+    get_s3_client().put_object(Bucket=S3_BUCKET, Key=key, Body=content)
+    return key
+
+
+@app.entrypoint
+async def invoke(payload):
+    if isinstance(payload, dict):
+        prompt     = payload.get("prompt", "")
+        file_b64   = payload.get("file", None)
+        s3_key_in  = payload.get("s3_key", None)
+        filename   = payload.get("filename", "log.txt")
+        session_id = payload.get("session_id", "default-session")
+    else:
+        prompt     = str(payload)
+        file_b64   = None
+        s3_key_in  = None
+        filename   = "log.txt"
+        session_id = "default-session"
+
+    # ── File via raw bytes (FAST PATH) ───────────────────────────────
+    file_bytes = payload.get("file_bytes", None)
+
+    if file_bytes:
+        try:
+            import time
+            start = time.time()
+
+            info = ingest_log_file(file_bytes, filename, session_id)
+
+            print("INGEST TIME:", time.time() - start)
+
+            return {
+                "reply": (
+                    f"Parsed '{info['filename']}': {info['records']} records across "
+                    f"{info['log_types']} log types.\n\n{info['summary']}"
+                )
+            }
+
+        except Exception as e:
+            return {"reply": f"Error parsing log file: {e}"}
+
+
+    # ── File already in S3 ────────────────────────────────────────────
+        # ── File already in S3 ────────────────────────────────────────────
+    elif s3_key_in:
+        try:
+            obj = get_s3_client().get_object(
+                Bucket=S3_BUCKET,
+                Key=s3_key_in
+            )
+            file_bytes = obj["Body"].read()
+
+            info = ingest_log_file(file_bytes, filename, session_id)
+
+            return {
+                "reply": (
+                    f"Parsed '{info['filename']}': {info['records']} records across "
+                    f"{info['log_types']} log types.\n\n{info['summary']}"
+                )
+            }
+
+        except Exception as e:
+            return {"reply": f"Error reading from S3: {e}"}
+
+
+    # ── Q&A path ──────────────────────────────────────────────────────
+    # ── Q&A path ──────────────────────────────────────────────────────
+    print(f"[QA] prompt={prompt!r} session_id={session_id!r}")
+
+    try:
+        apply_guardrail(prompt, source="INPUT")
+    except ValueError as e:
+        return {"reply": str(e)}
+
+    _current_session_var.set(session_id)
+
+    # ── Load memory ───────────────────────────────────────────────────
+    history = []
+    if MEMORY_ID:
+        try:
+            events = get_memory_client().list_events(
+                memory_id=MEMORY_ID,
+                actor_id=ACTOR_ID,
+                session_id=session_id,
+                max_results=10,
+            )
+            for event in events:
+                for item in event.get("payload", []):
+                    conv = item.get("conversational", {})
+                    role = conv.get("role", "")
+                    text = conv.get("content", {}).get("text", "")
+                    if role == "USER":
+                        history.append(HumanMessage(content=text))
+                    elif role == "ASSISTANT":
+                        history.append(AIMessage(content=text))
+        except Exception as e:
+            print(f"Memory retrieve error: {e}")
+
+    if len(history) > 6:
+        history = history[-6:]
+        
+    # ── Direct handlers ───────────────────────────────────────────────
+    log_entry = _log_store.get(session_id)
+
+    if log_entry:
+        p_lower = prompt.lower()
+
+        # List logs
+        if any(k in p_lower for k in (
+            "list", "what log", "all log", "log type", "instance"
+        )):
+            df = log_entry["df"]
+            log_counts = df.groupby("log_name_raw").size().sort_values(ascending=False)
+
+            lines = [f"| {name} | {count} |" for name, count in log_counts.items()]
+            table = "| Log Type | Count |\n|---|---|\n" + "\n".join(lines)
+
+            return {
+                "reply": (
+                    f"**{len(log_counts)} log types** in `{log_entry['filename']}`:\n\n{table}"
+                )
+            }
+
+    # ── Agent path ────────────────────────────────────────────────────
+    try:
+        output = run_agent(prompt, history)
+    except GraphRecursionError:
+        return {"reply": "Agent hit recursion limit. Try a simpler query."}
+    except Exception as e:
+        return {"reply": f"Agent error: {e}"}
+
+    try:
+        apply_guardrail(output, source="OUTPUT")
+    except ValueError as e:
+        return {"reply": str(e)}
+
+    # Save memory
+    if MEMORY_ID:
+        try:
+            get_memory_client().create_event(
+                memory_id=MEMORY_ID,
+                actor_id=ACTOR_ID,
+                session_id=session_id,
+                messages=[(prompt, "USER"), (output, "ASSISTANT")],
+            )
+        except Exception as e:
+            print(f"Memory save error: {e}")
+
+    return {"reply": output}

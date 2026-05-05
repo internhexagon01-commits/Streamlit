@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: atomicAquaLangGraph
+Version: 0.1.0
+Requires-Python: >=3.10
+Requires-Dist: bedrock-agentcore>=1.0.3
+Requires-Dist: langchain>=1.0.3
+Requires-Dist: langchain-mcp-adapters>=0.1.11
+Requires-Dist: langchain_aws>=1.0.0
+Requires-Dist: langgraph>=1.0.2
+Requires-Dist: mcp>=1.19.0
+Requires-Dist: python-dotenv>=1.2.1
+Requires-Dist: tiktoken==0.11.0
+Requires-Dist: numpy==1.26.4
+Requires-Dist: pywin32>=310; sys_platform == "win32"
