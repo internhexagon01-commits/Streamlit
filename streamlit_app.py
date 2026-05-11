@@ -355,6 +355,7 @@ html, body, [class*="css"] { font-family: var(--ui) !important; background: var(
 [data-testid="stMarkdownContainer"],
 [data-testid="stMarkdownContainer"] * {
   color: var(--text) !important;
+            background:transparent !important;
   font-family: var(--mono) !important;
   font-size: 14px !important;
 }
