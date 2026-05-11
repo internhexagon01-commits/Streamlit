@@ -400,14 +400,14 @@ html, body, [class*="css"] { font-family: var(--ui) !important; background: var(
 # ── Header ────────────────────────────────────────────────────────────
 st.markdown("""
 <header style="display:flex;align-items:center;gap:14px;padding:0 24px;
-  background:#00284c;border-bottom:2px solid #005198;
+  background:#00284c!important;border-bottom:2px solid #005198;
   position:relative;overflow:hidden;height:60px;
   max-width:880px;margin:0 auto;
   box-shadow:0 0 0 1px rgba(0,40,76,.08),0 4px 32px rgba(0,40,76,.06);">
   <div style="position:absolute;right:-60px;top:-40px;width:220px;height:140px;
     background:radial-gradient(ellipse at center,rgba(0,81,152,.45) 0%,transparent 70%);pointer-events:none;"></div>
   <div style="width:36px;height:36px;border-radius:5px;flex-shrink:0;
-    background:linear-gradient(135deg,#005198 0%,#4a9fd4 100%);display:grid;place-items:center;
+    background:linear-gradient(135deg,#005198 0%,#4a9fd4 100%)!important;display:grid;place-items:center;
     box-shadow:0 0 0 1px rgba(255,255,255,.15),0 2px 8px rgba(0,0,0,.3);">
     <svg viewBox="0 0 18 18" fill="none" width="18" height="18">
       <circle cx="9" cy="9" r="3.2" fill="#fff"/>
@@ -418,8 +418,8 @@ st.markdown("""
     </svg>
   </div>
   <div style="flex:1;">
-    <div style="font-family:'OpenSans-Regular';font-size:16px;font-weight:600;letter-spacing:.07em;color:#fff;line-height:1;padding-top:1px;">NovAtel AI Assistant</div>
-    <div style="font-size:12px;color:rgba(255,255,255,.52);margin-top:3px;letter-spacing:.07em;font-family:'OpenSans-Regular';">Query documentation &middot; Analyse logs &middot; GNSS insights</div>
+    <div style="font-family:'OpenSans-Regular';font-size:16px;font-weight:600;letter-spacing:.07em;color:#fff!important;line-height:1;padding-top:1px;">NovAtel AI Assistant</div>
+    <div style="font-size:12px;color:rgba(255,255,255,.52)!important;margin-top:3px;letter-spacing:.07em;font-family:'OpenSans-Regular';">Query documentation &middot; Analyse logs &middot; GNSS insights</div>
   </div>
 </header>
 """, unsafe_allow_html=True)
@@ -431,7 +431,7 @@ if not st.session_state.chat:
 <div style="display:flex;flex-direction:column;align-items:center;gap:10px;
   padding:48px 32px 20px;text-align:center;">
   <div style="width:56px;height:56px;border-radius:14px;margin-bottom:8px;
-    background:linear-gradient(135deg,#00284c 0%,#005198 100%);
+    background:linear-gradient(135deg,#00284c 0%,#005198 100%)!important;
     display:grid;place-items:center;box-shadow:0 4px 20px rgba(0,81,152,.3);">
     <svg viewBox="0 0 26 26" fill="none" width="26" height="26">
       <circle cx="13" cy="13" r="4.5" fill="#fff"/>
