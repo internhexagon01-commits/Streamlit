@@ -165,7 +165,7 @@ html, body, [class*="css"] { font-family: var(--ui) !important; background: var(
 [data-testid="stFileUploader"] {
   position: fixed !important;
     bottom: 10px !important;
-    right: max(26px, calc(50% - 430px + 26px)) !important;
+    right: max(20px, calc(50% - 410px)) !important;
     z-index: 1000 !important;
     width: 36px !important;
     height: 36px !important;
@@ -352,10 +352,11 @@ html, body, [class*="css"] { font-family: var(--ui) !important; background: var(
   letter-spacing: 0.6px;
   margin: 0 !important;
 }
-[data-testid="stMarkdownContainer"] {
+[data-testid="stMarkdownContainer"],
+[data-testid="stMarkdownContainer"] * {
+  color: var(--text) !important;
   font-family: var(--mono) !important;
   font-size: 14px !important;
-  
 }
 
 /* ── Chip buttons ── */
