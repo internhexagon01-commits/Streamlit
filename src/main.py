@@ -960,7 +960,33 @@ def run_log_pipeline(question: str, session_id: str) -> str:
     """
     print(f"[PIPELINE] question={question!r}")
     
-    set_status(session_id, "Analyzing your question...")
+    # Determine question intent for dynamic status messages
+    q_lower = question.lower()
+    intent = "your question"
+    if "minimum" in q_lower or "min" in q_lower or "lowest" in q_lower:
+        intent = "minimum value query"
+    elif "maximum" in q_lower or "max" in q_lower or "highest" in q_lower:
+        intent = "maximum value query"
+    elif "average" in q_lower or "mean" in q_lower:
+        intent = "average calculation"
+    elif "range" in q_lower:
+        intent = "range analysis"
+    elif "scintillation" in q_lower:
+        intent = "scintillation detection"
+    elif "jamming" in q_lower or "interference" in q_lower:
+        intent = "interference analysis"
+    elif "spoofing" in q_lower:
+        intent = "spoofing detection"
+    elif "error" in q_lower or "issue" in q_lower or "problem" in q_lower:
+        intent = "error analysis"
+    elif "status" in q_lower or "health" in q_lower:
+        intent = "status check"
+    elif "satellite" in q_lower or "sat" in q_lower:
+        intent = "satellite analysis"
+    elif "signal" in q_lower or "c/no" in q_lower or "cno" in q_lower:
+        intent = "signal quality analysis"
+    
+    set_status(session_id, f"Analyzing {intent}...")
 
     # Step 1: get file log inventory
     entry = _log_store.get(session_id)
@@ -971,7 +997,7 @@ def run_log_pipeline(question: str, session_id: str) -> str:
     print(f"[PIPELINE] {len(available_logs)} log types in file")
 
     # Step 2: LLM picks the log (from its own NovAtel knowledge, constrained to file inventory)
-    set_status(session_id, "Identifying relevant log type...")
+    set_status(session_id, "Determining which log type to analyze...")
     log_name = extract_log_name(question, available_logs)
     if not log_name:
         clear_status(session_id)
@@ -982,7 +1008,7 @@ def run_log_pipeline(question: str, session_id: str) -> str:
     is_numeric = any(kw in q_lower for kw in ("min", "max", "average", "mean", "range", "highest", "lowest"))
     
     # Step 4: Parallel fetch of docs and KB search (if needed)
-    set_status(session_id, f"Fetching {log_name} documentation...")
+    set_status(session_id, f"Loading {log_name} specifications...")
     import concurrent.futures
     
     official_docs = ""
@@ -995,7 +1021,7 @@ def run_log_pipeline(question: str, session_id: str) -> str:
         # Only fetch KB if needed
         kb_future = None
         if not is_numeric:
-            set_status(session_id, "Searching knowledge base...")
+            set_status(session_id, f"Searching {log_name} field definitions...")
             subject = extract_subject(question)
             kb_query = f"{log_name} {subject} field bit definition"
             kb_future = executor.submit(kb_search, kb_query, 15)
@@ -1013,7 +1039,7 @@ def run_log_pipeline(question: str, session_id: str) -> str:
         print(f"[PIPELINE] live docs unavailable for {log_name}, using KB only")
 
     # Step 5: extract exact field + bit — real docs are primary, KB is fallback
-    set_status(session_id, "Extracting field parameters...")
+    set_status(session_id, f"Identifying {log_name} field parameters...")
     params = extract_log_params(
         question, kb_elements,
         log_name=log_name,
@@ -1084,7 +1110,7 @@ def run_log_pipeline(question: str, session_id: str) -> str:
     print(f"[PIPELINE] → log={log_name} field={field_index} bit={bit_position} type={question_type}")
 
     # Step 6: Python analysis with proper error handling
-    set_status(session_id, f"Analyzing {log_name} data...")
+    set_status(session_id, f"Computing {log_name} statistics...")
     try:
         if question_type == "bit_check" and bit_position is not None:
             try:
@@ -1222,19 +1248,106 @@ def get_doc_agent():
         )
     return _doc_agent
 
-def run_doc_agent(prompt: str, history: list) -> str:
+def run_doc_agent(prompt: str, history: list, session_id: str = "") -> str:
     t0       = time.time()
+    
+    # Extract key topic from question for initial status
+    topic = ""
+    if session_id:
+        p_lower = prompt.lower()
+        topics_map = {
+            "span": "SPAN configuration", "imu": "IMU setup", "rtk": "RTK configuration",
+            "base station": "base station setup", "rover": "rover configuration",
+            "heading": "heading configuration", "alignment": "alignment setup",
+            "log": "logging configuration", "port": "port configuration",
+            "ethernet": "Ethernet setup", "serial": "serial port setup",
+            "wifi": "WiFi configuration", "ntrip": "NTRIP configuration",
+            "correction": "correction services", "ppp": "PPP configuration",
+            "antenna": "antenna setup", "gnss": "GNSS configuration",
+            "gps": "GPS setup", "glonass": "GLONASS setup",
+            "galileo": "Galileo setup", "beidou": "BeiDou setup",
+            "sbas": "SBAS configuration", "bestpos": "BESTPOS message",
+            "trackstat": "TRACKSTAT message", "rxstatus": "receiver status",
+            "time": "time configuration", "pps": "PPS output",
+            "event": "event markers", "trigger": "trigger setup",
+        }
+        for keyword, topic_name in topics_map.items():
+            if keyword in p_lower:
+                topic = topic_name
+                break
+        if not topic:
+            if "configure" in p_lower or "setup" in p_lower or "how to" in p_lower:
+                topic = "configuration"
+            elif "what is" in p_lower or "explain" in p_lower:
+                topic = "documentation"
+            else:
+                topic = "information"
+        
+        # ── Set an immediate, visible status so the UI shows something right away ──
+        set_status(session_id, f"Searching knowledge base for {topic}..." if topic else "Searching knowledge base...")
+    
     messages = [SystemMessage(content=_DOC_AGENT_PROMPT)] + history + [HumanMessage(content=prompt)]
+    
     try:
-        result = get_doc_agent().invoke(
+        final_answer = ""
+        agent = get_doc_agent()
+        kb_search_done = False
+        
+        for event in agent.stream(
             {"messages": messages},
             config={"recursion_limit": 8},
-        )
-        answer = result["messages"][-1].content
+            stream_mode="values"
+        ):
+            if not session_id or "messages" not in event:
+                continue
+
+            last_msg = event["messages"][-1]
+            msg_type = last_msg.__class__.__name__
+
+            # ── AI is about to call a tool ────────────────────────────
+            if msg_type == "AIMessage":
+                tool_calls = getattr(last_msg, "tool_calls", None) or []
+                if tool_calls:
+                    tool_name = tool_calls[0].get("name", "") if isinstance(tool_calls[0], dict) else getattr(tool_calls[0], "name", "")
+                    if tool_name == "kb_retriever":
+                        label = f"Searching {topic} documentation..." if topic else "Searching documentation..."
+                        set_status(session_id, label)
+                    elif tool_name == "context_expander":
+                        set_status(session_id, "Expanding context with related documentation...")
+                else:
+                    # Final AI message (no tool call) — formulating response
+                    if last_msg.content:
+                        set_status(session_id, "Formulating response...")
+                        final_answer = last_msg.content
+
+            # ── Tool result returned ──────────────────────────────────
+            elif msg_type == "ToolMessage":
+                tool_name = getattr(last_msg, "name", "")
+                if tool_name == "kb_retriever":
+                    if not kb_search_done:
+                        kb_search_done = True
+                        set_status(session_id, "Analysing retrieved documentation...")
+                elif tool_name == "context_expander":
+                    set_status(session_id, "Processing expanded context...")
+        
+        if not final_answer:
+            # Fallback if streaming didn't capture the answer
+            set_status(session_id, "Generating answer...")
+            result = agent.invoke(
+                {"messages": messages},
+                config={"recursion_limit": 8},
+            )
+            final_answer = result["messages"][-1].content
+        
         print(f"[DOC_AGENT] took={time.time()-t0:.2f}s")
-        return answer
+        if session_id:
+            clear_status(session_id)
+        return final_answer
+        
     except Exception as e:
         print(f"[DOC_AGENT] error: {e}")
+        if session_id:
+            clear_status(session_id)
         raise
 
 # ── Direct handlers (fully deterministic, zero LLM) ───────────────────
@@ -1346,6 +1459,67 @@ def upload_to_s3(content: bytes, filename: str) -> str:
     get_s3_client().put_object(Bucket=S3_BUCKET, Key=key, Body=content)
     return key
 
+
+# ── Binary pre-processor ──────────────────────────────────────────────
+_BINARY_EXTENSIONS = ('.gps', '.bin', '.raw', '.nov', '.novb')
+
+def is_binary_log(filename: str, file_bytes: bytes) -> bool:
+    if any(filename.lower().endswith(ext) for ext in _BINARY_EXTENSIONS):
+        return True
+    if len(file_bytes) >= 3 and file_bytes[:3] == b'\xaa\x44\x12':
+        return True
+    return False
+
+def convert_binary_to_ascii(file_bytes: bytes, filename: str) -> tuple[bytes, str]:
+    import novatel_edie as edie
+
+    ascii_lines = []
+    skipped     = 0
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.bin') as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
+    fp = None
+    try:
+        fp = edie.FileParser(tmp_path)
+
+        while True:
+            try:
+                result = fp.convert(edie.ENCODE_FORMAT.ASCII)
+                if isinstance(result, edie.MessageData):
+                    line = result.message.decode('utf-8', errors='replace').strip()
+                    if line:
+                        ascii_lines.append(line)
+                else:
+                    skipped += 1
+            except edie.StreamEmptyException:
+                break
+            except Exception as e:
+                skipped += 1
+                continue
+
+    finally:
+        del fp  # ✅ release EDIE's file handle first (Windows fix)
+        try:
+            os.remove(tmp_path)  # now safe to delete
+        except Exception as e:
+            print(f"[PREPROCESS] Warning: could not delete temp file: {e}")
+
+    ascii_content = '\n'.join(ascii_lines)
+    new_filename  = os.path.splitext(filename)[0] + '_converted.ascii'
+    print(f"[PREPROCESS] '{filename}' → '{new_filename}' "
+          f"({len(ascii_lines)} messages, {skipped} skipped)")
+    return ascii_content.encode('utf-8'), new_filename
+
+def preprocess_file(file_bytes: bytes, filename: str) -> tuple[bytes, str]:
+    if is_binary_log(filename, file_bytes):
+        print(f"[PREPROCESS] Binary detected: '{filename}', converting via EDIE...")
+        return convert_binary_to_ascii(file_bytes, filename)
+    print(f"[PREPROCESS] ASCII file: '{filename}', no conversion needed.")
+    return file_bytes, filename
+
+
 # ── Main entrypoint ───────────────────────────────────────────────────
 @app.entrypoint
 async def invoke(payload):
@@ -1363,6 +1537,7 @@ async def invoke(payload):
     if file_b64:
         try:
             file_bytes = base64.b64decode(file_b64)
+            file_bytes, filename = preprocess_file(file_bytes, filename)
             if S3_BUCKET and len(file_bytes) > SIZE_THRESHOLD:
                 upload_to_s3(file_bytes, filename)
             info = ingest_log_file(file_bytes, filename, session_id)
@@ -1453,7 +1628,7 @@ async def invoke(payload):
     if is_non_gnss and log_entry:
         print("[ROUTE] → doc agent (non-GNSS question, ignoring log file)")
         try:
-            output = run_doc_agent(prompt, [])
+            output = run_doc_agent(prompt, [], session_id)
         except GraphRecursionError:
             return {"result": "Hit the search budget. Please try rephrasing."}
         except Exception as e:
@@ -1661,12 +1836,13 @@ async def invoke(payload):
                           "jamming", "spoofing", "interference", "error", "issue")
     has_analysis_intent = any(kw in p for kw in _ANALYSIS_KEYWORDS)
     has_specific_reference = any(kw in p for kw in ["in this file", "in the file", "in my file", 
-                                                      "this log", "the log", "field", "bit"])
+                                                      "of this file", "of the file", "of my file",
+                                                      "this log", "the log", "my log", "field", "bit"])
     
     if is_general and not has_specific_reference and not has_analysis_intent and log_entry:
         print("[ROUTE] → doc agent (general question, ignoring file context)")
         try:
-            output = run_doc_agent(prompt, history)
+            output = run_doc_agent(prompt, history, session_id)
         except GraphRecursionError:
             return {"result": "Hit the search budget. Please try rephrasing."}
         except Exception as e:
@@ -1681,14 +1857,23 @@ async def invoke(payload):
                          "any second","each second","per second","all second")
         if any(kw in p for kw in _GAP_TRIGGERS):
             print("[DIRECT] → data gap analysis")
-            return _direct_data_gap(log_entry)
+            set_status(session_id, "Checking for time gaps in log data...")
+            result = _direct_data_gap(log_entry)
+            clear_status(session_id)
+            return result
 
         if not is_event and any(kw in p for kw in _LIST_TRIGGERS):
             print("[DIRECT] → list logs")
-            return _direct_list_logs(log_entry)
+            set_status(session_id, "Retrieving log inventory from file...")
+            result = _direct_list_logs(log_entry)
+            clear_status(session_id)
+            return result
         if not is_event and any(kw in p for kw in _TIME_TRIGGERS):
             print("[DIRECT] → time range")
-            return _direct_time_range(log_entry)
+            set_status(session_id, "Computing file time range from GPS timestamps...")
+            result = _direct_time_range(log_entry)
+            clear_status(session_id)
+            return result
 
     # 3. Main routing logic
     try:
@@ -1699,7 +1884,7 @@ async def invoke(payload):
         else:
             # Documentation agent — no file loaded
             print("[ROUTE] → doc agent")
-            output = run_doc_agent(prompt, history)
+            output = run_doc_agent(prompt, history, session_id)
 
     except GraphRecursionError:
         return {"result": "Hit the search budget. Please try rephrasing."}
