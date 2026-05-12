@@ -97,7 +97,9 @@ html, body, [class*="css"] { font-family: var(--ui) !important; background: var(
   padding: 0 !important;
   margin: 0 auto !important;
 }
-
+[data-baseweb="textarea"]{
+background-color:none
+}
 /* ── Bottom bar ── */
 [data-testid="stBottom"] {
   max-width: 880px !important;
@@ -354,10 +356,11 @@ html, body, [class*="css"] { font-family: var(--ui) !important; background: var(
 }
 [data-testid="stMarkdownContainer"],
 [data-testid="stMarkdownContainer"] * {
-  color: var(--text) !important;
-            background:transparent !important;
-  font-family: var(--mono) !important;
-  font-size: 14px !important;
+  color: var(--text);
+            background:transparent;
+  font-family: var(--mono);
+  font-size: 14px;
+  text-decoration:none;
 }
 
 /* ── Chip buttons ── */
