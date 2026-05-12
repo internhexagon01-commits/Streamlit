@@ -1283,50 +1283,56 @@ def run_doc_agent(prompt: str, history: list, session_id: str = "") -> str:
             else:
                 topic = "information"
         
-        set_status(session_id, f"Understanding your question about {topic}...")
+        # ── Set an immediate, visible status so the UI shows something right away ──
+        set_status(session_id, f"Searching knowledge base for {topic}..." if topic else "Searching knowledge base...")
     
     messages = [SystemMessage(content=_DOC_AGENT_PROMPT)] + history + [HumanMessage(content=prompt)]
     
     try:
-        # Stream the agent execution to capture real-time progress
         final_answer = ""
         agent = get_doc_agent()
+        kb_search_done = False
         
         for event in agent.stream(
             {"messages": messages},
             config={"recursion_limit": 8},
             stream_mode="values"
         ):
-            if session_id and "messages" in event:
-                last_msg = event["messages"][-1]
-                
-                # Check if it's a tool call
-                if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
-                    tool_name = last_msg.tool_calls[0].get('name', '')
-                    if tool_name == 'kb_retriever':
-                        if topic:
-                            set_status(session_id, f"Searching {topic} in knowledge base...")
-                        else:
-                            set_status(session_id, "Searching knowledge base...")
-                    elif tool_name == 'context_expander':
+            if not session_id or "messages" not in event:
+                continue
+
+            last_msg = event["messages"][-1]
+            msg_type = last_msg.__class__.__name__
+
+            # ── AI is about to call a tool ────────────────────────────
+            if msg_type == "AIMessage":
+                tool_calls = getattr(last_msg, "tool_calls", None) or []
+                if tool_calls:
+                    tool_name = tool_calls[0].get("name", "") if isinstance(tool_calls[0], dict) else getattr(tool_calls[0], "name", "")
+                    if tool_name == "kb_retriever":
+                        label = f"Searching {topic} documentation..." if topic else "Searching documentation..."
+                        set_status(session_id, label)
+                    elif tool_name == "context_expander":
                         set_status(session_id, "Expanding context with related documentation...")
-                
-                # Check if it's a tool response
-                elif hasattr(last_msg, 'content') and hasattr(last_msg, 'name'):
-                    tool_name = getattr(last_msg, 'name', '')
-                    if tool_name == 'kb_retriever':
-                        set_status(session_id, "Analyzing retrieved documentation...")
-                    elif tool_name == 'context_expander':
-                        set_status(session_id, "Processing expanded context...")
-                
-                # Check if it's the final AI message
-                elif hasattr(last_msg, 'content') and last_msg.__class__.__name__ == 'AIMessage':
-                    if not hasattr(last_msg, 'tool_calls') or not last_msg.tool_calls:
-                        set_status(session_id, "Formulating detailed response...")
+                else:
+                    # Final AI message (no tool call) — formulating response
+                    if last_msg.content:
+                        set_status(session_id, "Formulating response...")
                         final_answer = last_msg.content
+
+            # ── Tool result returned ──────────────────────────────────
+            elif msg_type == "ToolMessage":
+                tool_name = getattr(last_msg, "name", "")
+                if tool_name == "kb_retriever":
+                    if not kb_search_done:
+                        kb_search_done = True
+                        set_status(session_id, "Analysing retrieved documentation...")
+                elif tool_name == "context_expander":
+                    set_status(session_id, "Processing expanded context...")
         
         if not final_answer:
             # Fallback if streaming didn't capture the answer
+            set_status(session_id, "Generating answer...")
             result = agent.invoke(
                 {"messages": messages},
                 config={"recursion_limit": 8},

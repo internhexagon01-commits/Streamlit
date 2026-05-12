@@ -1,5 +1,8 @@
 import sys
 import os
+import base64
+from pathlib import Path
+
 
 sys.path.append(os.path.abspath("."))
 
@@ -38,6 +41,18 @@ _executor = ThreadPoolExecutor(max_workers=4)
 def run_async(coro):
     return _executor.submit(lambda: asyncio.run(coro)).result()
 
+@st.cache_data
+def get_logo_data_url():
+    logo_path = Path(__file__).parent / "src" / "novatel_logo.png"
+    if not logo_path.exists():
+        st.error(f"Logo not found at: {logo_path}")
+        return ""
+    b64 = base64.b64encode(logo_path.read_bytes()).decode()
+    # change image/png to image/jpeg or image/svg+xml if your file is different
+    return f"data:image/png;base64,{b64}"
+ 
+LOGO_URL = get_logo_data_url()
+
 def upload_to_s3_with_progress(file_bytes: bytes, filename: str) -> str:
     key = f"logs/{filename}"
     cfg = TransferConfig(multipart_threshold=8*1024*1024, multipart_chunksize=8*1024*1024, max_concurrency=4, use_threads=True)
@@ -47,10 +62,11 @@ def upload_to_s3_with_progress(file_bytes: bytes, filename: str) -> str:
     except Exception as e:
         raise Exception(f"S3 upload failed: {str(e)}")
 
-if "session_id"   not in st.session_state: st.session_state.session_id   = str(uuid.uuid4())
-if "chat"         not in st.session_state: st.session_state.chat         = []
-if "pending_chip" not in st.session_state: st.session_state.pending_chip = None
-if "client_id"    not in st.session_state: st.session_state.client_id    = str(uuid.uuid4())
+if "session_id"      not in st.session_state: st.session_state.session_id      = str(uuid.uuid4())
+if "chat"            not in st.session_state: st.session_state.chat            = []
+if "pending_chip"    not in st.session_state: st.session_state.pending_chip    = None
+if "client_id"       not in st.session_state: st.session_state.client_id       = str(uuid.uuid4())
+if "pending_upload"  not in st.session_state: st.session_state.pending_upload  = None  # file waiting to be processed
 
 st.markdown(
     '<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet"/>',
@@ -403,7 +419,7 @@ background-color:none
 
 
 # ── Header ────────────────────────────────────────────────────────────
-st.markdown("""
+st.markdown(f"""
 <header style="display:flex;align-items:center;gap:14px;padding:0 24px;
   background:#00284c;border-bottom:2px solid #005198;
   position:relative;overflow:hidden;height:60px;
@@ -412,15 +428,12 @@ st.markdown("""
   <div style="position:absolute;right:-60px;top:-40px;width:220px;height:140px;
     background:radial-gradient(ellipse at center,rgba(0,81,152,.45) 0%,transparent 70%);pointer-events:none;"></div>
   <div style="width:36px;height:36px;border-radius:5px;flex-shrink:0;
-    background:linear-gradient(135deg,#005198 0%,#4a9fd4 100%);display:grid;place-items:center;
+    background-image:url('{LOGO_URL}');
+    background-size:34px;
+    background-repeat:no-repeat;
+    background-position:center;
+    background-color:white;
     box-shadow:0 0 0 1px rgba(255,255,255,.15),0 2px 8px rgba(0,0,0,.3);">
-    <svg viewBox="0 0 18 18" fill="none" width="18" height="18">
-      <circle cx="9" cy="9" r="3.2" fill="#fff"/>
-      <circle cx="9" cy="2.2" r="1.4" fill="rgba(255,255,255,.75)"/>
-      <circle cx="9" cy="15.8" r="1.4" fill="rgba(255,255,255,.75)"/>
-      <circle cx="2.2" cy="9" r="1.4" fill="rgba(255,255,255,.75)"/>
-      <circle cx="15.8" cy="9" r="1.4" fill="rgba(255,255,255,.75)"/>
-    </svg>
   </div>
   <div style="flex:1;">
     <div style="font-family:'OpenSans-Regular';font-size:16px;font-weight:600;letter-spacing:.07em;color:#fff;line-height:1;padding-top:1px;">NovAtel AI Assistant</div>
@@ -428,27 +441,20 @@ st.markdown("""
   </div>
 </header>
 """, unsafe_allow_html=True)
-
-
+ 
+ 
 # ── Welcome screen ────────────────────────────────────────────────────
 if not st.session_state.chat:
-    st.markdown("""
+    st.markdown(f"""
 <div style="display:flex;flex-direction:column;align-items:center;gap:10px;
   padding:48px 32px 20px;text-align:center;">
   <div style="width:56px;height:56px;border-radius:14px;margin-bottom:8px;
-    background:linear-gradient(135deg,#00284c 0%,#005198 100%);
-    display:grid;place-items:center;box-shadow:0 4px 20px rgba(0,81,152,.3);">
-    <svg viewBox="0 0 26 26" fill="none" width="26" height="26">
-      <circle cx="13" cy="13" r="4.5" fill="#fff"/>
-      <circle cx="13" cy="3" r="2" fill="rgba(255,255,255,.7)"/>
-      <circle cx="13" cy="23" r="2" fill="rgba(255,255,255,.7)"/>
-      <circle cx="3" cy="13" r="2" fill="rgba(255,255,255,.7)"/>
-      <circle cx="23" cy="13" r="2" fill="rgba(255,255,255,.7)"/>
-      <line x1="13" y1="7.5" x2="13" y2="10.5" stroke="rgba(255,255,255,.35)" stroke-width="1"/>
-      <line x1="13" y1="15.5" x2="13" y2="18.5" stroke="rgba(255,255,255,.35)" stroke-width="1"/>
-      <line x1="7.5" y1="13" x2="10.5" y2="13" stroke="rgba(255,255,255,.35)" stroke-width="1"/>
-      <line x1="15.5" y1="13" x2="18.5" y2="13" stroke="rgba(255,255,255,.35)" stroke-width="1"/>
-    </svg>
+    background-image:url('{LOGO_URL}');
+    background-size:50px;
+    background-repeat:no-repeat;
+    background-position:center;
+    background-color:white;
+    box-shadow:0 4px 20px rgba(0,81,152,.3);">
   </div>
   <strong style="font-family:'OpenSans-Regular';font-size:16px;font-weight:600;color:#00284c;letter-spacing:.05em;">NovAtel AI Assistant</strong>
   <p style="font-size:14px;color:#6080a0;max-width:360px;line-height:1.6;font-family:'OpenSans-Regular';margin:0 0 4px;">
@@ -512,35 +518,81 @@ if uploaded_file and uploaded_file.file_id not in st.session_state.get("processe
     if file_size > MAX_UPLOAD:
         st.error(f"File is {file_size / (1024*1024):.1f} MB. Max allowed is {MAX_UPLOAD / (1024*1024):.0f} MB.")
     else:
+        # ── STEP 1: Show chip immediately ─────────────────────────────
+        size_str = f"{file_size / 1024:.1f} KB" if file_size < 1024 * 1024 else f"{file_size / (1024*1024):.1f} MB"
         file_chip_html = f"""
         <div style="display:inline-flex;align-items:center;gap:7px;
           background:#e8f2fa;border:1px solid #b8d0e8;border-radius:8px;
           padding:6px 12px;font-size:12px;color:#005198;font-family:monospace;position:relative;bottom:3px;">
-          📄&nbsp;<strong>{file_name}</strong>
-          
+          📄&nbsp;<strong>{file_name}</strong>&nbsp;
         </div>
         """
         st.session_state.chat.append(("file", file_chip_html))
+        # Store the upload info for processing on the next rerun
         file_bytes = uploaded_file.read()
+        st.session_state.pending_upload = {
+            "file_bytes": file_bytes,
+            "file_name": file_name,
+            "file_size": file_size,
+        }
         st.session_state.session_id = "session-" + uuid.uuid4().hex[:10]
+        st.rerun()  # rerun immediately so chip renders before processing starts
 
+# ── Process pending upload (runs on the rerun after chip is shown) ────
+if st.session_state.pending_upload:
+    upload_info = st.session_state.pending_upload
+    st.session_state.pending_upload = None  # clear so we don't re-process
+
+    file_bytes = upload_info["file_bytes"]
+    file_name  = upload_info["file_name"]
+    file_size  = upload_info["file_size"]
+
+    import threading, time
+    # Capture session_id NOW on the main thread — background threads cannot access st.session_state
+    file_session_id = st.session_state.session_id
+    result_container = {"response": None, "done": False}
+
+    def run_file_agent():
         try:
             if file_size <= SIZE_THRESHOLD:
-                with st.spinner(f"Processing {file_name}..."):
-                    file_b64 = base64.b64encode(file_bytes).decode("utf-8")
-                    response = run_async(agent_invoke({"file": file_b64, "filename": file_name, "session_id": st.session_state.session_id}))
+                file_b64 = base64.b64encode(file_bytes).decode("utf-8")
+                result_container["response"] = run_async(agent_invoke({
+                    "file": file_b64, "filename": file_name,
+                    "session_id": file_session_id,
+                }))
             else:
-                with st.spinner(f"Uploading {file_name} to S3..."):
-                    s3_key = upload_to_s3_with_progress(file_bytes, file_name)
-                with st.spinner(f"Processing {file_name}..."):
-                    response = run_async(agent_invoke({"s3_key": s3_key, "filename": file_name, "session_id": st.session_state.session_id}))
-            st.session_state.chat.append(("agent", response.get("result", str(response))))
+                s3_key = upload_to_s3_with_progress(file_bytes, file_name)
+                result_container["response"] = run_async(agent_invoke({
+                    "s3_key": s3_key, "filename": file_name,
+                    "session_id": file_session_id,
+                }))
         except Exception as e:
             import traceback
-            error_details = traceback.format_exc()
-            print(f"[ERROR] File upload failed: {error_details}")
-            st.session_state.chat.append(("agent", f"Error processing file: {str(e)}\n\nDetails: {error_details[:500]}"))
-        st.rerun()
+            print(f"[ERROR] File upload failed: {traceback.format_exc()}")
+            result_container["response"] = {"result": f"Error processing file: {str(e)}"}
+        result_container["done"] = True
+
+    file_thread = threading.Thread(target=run_file_agent, daemon=True)
+    file_thread.start()
+
+    # Poll for status while processing
+    file_status_placeholder = st.empty()
+    last_status = ""
+    while not result_container["done"]:
+        current_status = agent_get_status(file_session_id)
+        if not current_status:
+            current_status = f"Processing {file_name}..." if file_size <= SIZE_THRESHOLD else f"Uploading {file_name} to cloud..."
+        if current_status != last_status:
+            with file_status_placeholder.container():
+                with st.chat_message("assistant", avatar="🛰"):
+                    st.markdown(f"*{current_status}*")
+            last_status = current_status
+        time.sleep(0.3)
+
+    file_status_placeholder.empty()
+    response = result_container["response"]
+    st.session_state.chat.append(("agent", response.get("result", str(response)) if response else "Error processing file."))
+    st.rerun()
 
 # ── Handle typed message ──────────────────────────────────────────────
 if user_input:
