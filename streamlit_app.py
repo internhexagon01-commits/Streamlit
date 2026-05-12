@@ -1,5 +1,6 @@
 import sys
 import os
+import streamlit as st
 import base64
 from pathlib import Path
 
@@ -43,13 +44,21 @@ def run_async(coro):
 
 @st.cache_data
 def get_logo_data_url():
-    logo_path = Path(__file__).parent / "src" / "novatel_logo.png"
-    if not logo_path.exists():
-        st.error(f"Logo not found at: {logo_path}")
-        return ""
-    b64 = base64.b64encode(logo_path.read_bytes()).decode()
-    # change image/png to image/jpeg or image/svg+xml if your file is different
-    return f"data:image/png;base64,{b64}"
+    # Try multiple possible locations
+    possible_paths = [
+        Path(__file__).parent / "src" / "novatel_logo.png",
+        Path(__file__).parent / "novatel_logo.png",
+        Path("src") / "novatel_logo.png",
+        Path("novatel_logo.png"),
+    ]
+    
+    for logo_path in possible_paths:
+        if logo_path.exists():
+            b64 = base64.b64encode(logo_path.read_bytes()).decode()
+            return f"data:image/png;base64,{b64}"
+    
+    st.error(f"Logo not found. Tried: {[str(p) for p in possible_paths]}")
+    return ""
  
 LOGO_URL = get_logo_data_url()
 
