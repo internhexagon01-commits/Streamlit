@@ -362,7 +362,9 @@ background-color:none
   font-size: 14px;
   text-decoration:none;
 }
-
+.st-b1{
+            background-color:transparent !important
+            }
 /* ── Chip buttons ── */
 [data-testid="stHorizontalBlock"] [data-testid="stButton"] button {
   padding: 7px 15px !important;
