@@ -463,21 +463,7 @@ if not st.session_state.chat:
 </div>
 """, unsafe_allow_html=True)
 
-    chips = [
-        ("📡  Receiver status logs",   "What logs show receiver status?"),
-        ("📍  BESTPOS message fields",  "Explain BESTPOS message fields"),
-        ("📋  Common positioning logs", "Common Positioning Logs"),
-        ("📂  Upload a log file",       "__upload__"),
-    ]
-    cols = st.columns(4)
-    for col, (label, value) in zip(cols, chips):
-        with col:
-            if st.button(label, key=f"chip_{label[:12]}"):
-                if value == "__upload__":
-                    st.info("Use the 📎 paperclip button at the bottom-right to upload a log file.")
-                else:
-                    st.session_state.pending_chip = value
-                    st.rerun()
+
 
 # ── Flush pending chip ────────────────────────────────────────────────
 if st.session_state.pending_chip:
